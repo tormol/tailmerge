@@ -6,13 +6,15 @@ use std::path::Path;
 use std::os::unix::ffi::OsStringExt;
 #[cfg(wasi)]
 use std::os::wasi::ffi::OsStringExt;
-use std::io::{stderr, Write, Error, Read, stdout, IoSlice};
+use std::io::{stderr, Write, Error as IoError, Read, stdout, IoSlice};
 use std::error::Error as _;
 use std::collections::BinaryHeap;
 use std::ops::Range;
 use std::cmp::{Ord, PartialOrd, Ordering};
+#[cfg(any(debug_assertions, feature="debug"))]
+use std::fmt::{Debug, Formatter, Result as FmtResult};
 
-fn write_all_vectored(to: &mut dyn Write,  buffers: &[IoSlice]) -> Result<(), Error> {
+fn write_all_vectored(to: &mut dyn Write,  buffers: &[IoSlice]) -> Result<(), IoError> {
     let mut i = 0;
     while i < buffers.len() {
         let mut wrote = to.write_vectored(&buffers[i..])?;
@@ -28,7 +30,7 @@ fn write_all_vectored(to: &mut dyn Write,  buffers: &[IoSlice]) -> Result<(), Er
     Ok(())
 }
 
-fn error(what: &str,  path: &[u8],  e: Error,  exit_code: i32) -> ! {
+fn error(what: &str,  path: &[u8],  e: IoError,  exit_code: i32) -> ! {
     let stderr = stderr();
     let _ = write_all_vectored(&mut stderr.lock(), &[
         IoSlice::new(what.as_bytes()),
@@ -48,7 +50,6 @@ struct Source {
     buffer: Box<[u8]>,
     read: usize,
 }
-
 impl Source {
     /// Returns None on EOF and the length of the next line otherwise.
     pub fn read_next_line(&mut self,  next_line_begins: usize) -> Option<usize> {
@@ -61,6 +62,7 @@ impl Source {
                     self.read += new_bytes;
                     let new_part = &self.buffer[no_newline..self.read];
                     if let Some(found) = new_part.iter().position(|&b| b == b'\n' ) {
+                        //let _ = stdout().write_all(&self.buffer[..no_newline+found+1]);
                         return Some(no_newline+found+1);
                     } else if self.buffer.len() - self.read < self.buffer.len() / 4 {
                         let mut new = Vec::with_capacity(self.buffer.len()*2);
@@ -91,6 +93,16 @@ impl Source {
         }
     }
 }
+#[cfg(any(debug_assertions, feature="debug"))]
+impl Debug for Source {
+    fn fmt(&self,  fmtr: &mut Formatter) -> FmtResult {
+        fmtr.debug_struct("Source")
+            .field("path", &String::from_utf8_lossy(&self.path))
+            .field("buffer", &String::from_utf8_lossy(&self.buffer[..self.read]))
+            .field("read", &self.read)
+            .finish()
+    }
+}
 
 struct FirstLine<'a> {
     /// borrows a Source.buffer[self.starts_at..Source.read]
@@ -116,6 +128,17 @@ impl<'a> PartialOrd for FirstLine<'a> {
 impl<'a> Ord for FirstLine<'a> {
     fn cmp(&self,  rhs: &Self) -> Ordering {
         rhs.read[..rhs.line_length].cmp(&self.read[..self.line_length])
+    }
+}
+#[cfg(any(debug_assertions, feature="debug"))]
+impl<'a> Debug for FirstLine<'a> {
+    fn fmt(&self,  fmtr: &mut Formatter) -> FmtResult {
+        fmtr.debug_struct("FirstLine")
+            .field("line", &String::from_utf8_lossy(&self.read[..self.line_length]))
+            .field("read_length", &self.read.len())
+            .field("starts_at", &self.starts_at)
+            .field("source", &self.source)
+            .finish()
     }
 }
 
@@ -163,38 +186,47 @@ fn main() {
         }
     }
 
-    let mut has_printed = false;
+    let mut first_print = true;
     let mut last_printed = sources.len();
     let stdout = stdout();
     let mut stdout = stdout.lock();
     while ! sources.is_empty() {
+        #[cfg(feature="debug")]
+        eprintln!("sources: {:?}", &sources);
+        #[cfg(feature="debug")]
+        eprintln!("next_line: {:?}", &next_line);
         let mut sorter = BinaryHeap::<FirstLine>::with_capacity(sources.len());
         for (i, line) in next_line.iter_mut().enumerate() {
             sorter.push(FirstLine {
-                read: &sources[i].buffer[line.clone()],
+                read: &sources[i].buffer[line.start..sources[i].read],
                 line_length: line.end - line.start,
                 starts_at: line.start,
                 source: i,
             });
         }
+        #[cfg(feature="debug")]
+        eprintln!("sorter before: {:?}", &sorter);
 
         // merge as many available lines as possible
         let mut ready_output = Vec::<IoSlice>::new();
         let (needs_more, written) = loop {
             let mut next = sorter.pop().unwrap();
             if next.source != last_printed {
-                if has_printed {
-                    ready_output.push(IoSlice::new(b"\n>>> "));
-                } else {
-                    ready_output.push(IoSlice::new(b">>> "));
-                    has_printed = true;
-                }
+                ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
                 ready_output.push(IoSlice::new(&sources[next.source].path));
                 ready_output.push(IoSlice::new(b"\n"));
+                #[cfg(feature="debug")] {
+                    write_all_vectored(&mut stdout, &ready_output).expect("write path");
+                    ready_output.clear();
+                }
                 last_printed = next.source;
+                first_print = false;
             }
             let (this_line, after) = next.read.split_at(next.line_length);
+            #[cfg(not(feature="debug"))]
             ready_output.push(IoSlice::new(this_line));
+            #[cfg(feature="debug")]
+            stdout.write_all(this_line).expect("write line");
             next.starts_at += this_line.len();
             if let Some(line_len) = after.iter().position(|&b| b == b'\n' ) {
                 next.read = after;
@@ -204,6 +236,8 @@ fn main() {
                 break (next.source, next.starts_at);
             }
         };
+        #[cfg(feature="debug")]
+        eprintln!("sorter after: {:?}", &sorter);
         // empty the next line information into next_line, so that the borrow of source expires
         for line in sorter {
             next_line[line.source] = line.starts_at..line.starts_at+line.line_length;
