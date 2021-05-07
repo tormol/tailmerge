@@ -206,71 +206,66 @@ fn main() {
     let last_printed = Cell::new(sources.len());
     let stdout = stdout();
     let mut stdout = stdout.lock();
+
+    #[cfg(feature="debug")]
+    eprintln!("sources: {:?}", &sources);
+    #[cfg(feature="debug")]
+    eprintln!("next_line: {:?}", &next_line);
+    let mut sorter = BinaryHeap::<FirstLine>::with_capacity(sources.len());
+    for (i, line) in next_line.iter_mut().enumerate() {
+        sorter.push(FirstLine {
+            read: &sources[i].buffer[line.start..sources[i].read],
+            line_length: line.end - line.start,
+            starts_at: line.start,
+            source_index: i,
+            last_source: &last_printed,
+        });
+    }
+
+    // merge as many available lines as possible
+    let mut ready_output = Vec::<IoSlice>::new();
     while ! sources.is_empty() {
         #[cfg(feature="debug")]
-        eprintln!("sources: {:?}", &sources);
+        eprintln!("sorter before: {:?}", &sorter);
+        let mut next = sorter.pop().unwrap();
+        if next.source_index != last_printed.get() {
+            ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
+            ready_output.push(IoSlice::new(&sources[next.source_index].path));
+            ready_output.push(IoSlice::new(b"\n"));
+            #[cfg(feature="debug")] {
+                write_all_vectored(&mut stdout, &ready_output).expect("write path");
+                ready_output.clear();
+            }
+            last_printed.set(next.source_index);
+            first_print = false;
+        }
+        let (this_line, after) = next.read.split_at(next.line_length);
+        #[cfg(not(feature="debug"))]
+        ready_output.push(IoSlice::new(this_line));
         #[cfg(feature="debug")]
-        eprintln!("next_line: {:?}", &next_line);
-        let mut sorter = BinaryHeap::<FirstLine>::with_capacity(sources.len());
-        for (i, line) in next_line.iter_mut().enumerate() {
-            sorter.push(FirstLine {
-                read: &sources[i].buffer[line.start..sources[i].read],
-                line_length: line.end - line.start,
-                starts_at: line.start,
-                source_index: i,
-                last_source: &last_printed,
-            });
-        }
-
-        // merge as many available lines as possible
-        let mut ready_output = Vec::<IoSlice>::new();
-        let (needs_more, written) = loop {
-            #[cfg(feature="debug")]
-            eprintln!("sorter before: {:?}", &sorter);
-            let mut next = sorter.pop().unwrap();
-            if next.source_index != last_printed.get() {
-                ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
-                ready_output.push(IoSlice::new(&sources[next.source_index].path));
-                ready_output.push(IoSlice::new(b"\n"));
-                #[cfg(feature="debug")] {
-                    write_all_vectored(&mut stdout, &ready_output).expect("write path");
-                    ready_output.clear();
-                }
-                last_printed.set(next.source_index);
-                first_print = false;
-            }
-            let (this_line, after) = next.read.split_at(next.line_length);
-            #[cfg(not(feature="debug"))]
-            ready_output.push(IoSlice::new(this_line));
-            #[cfg(feature="debug")]
-            stdout.write_all(this_line).expect("write line");
-            next.starts_at += this_line.len();
-            #[cfg(feature="debug")]
-            eprintln!("sorter after: {:?}", &sorter);
-            if let Some(line_len) = after.iter().position(|&b| b == b'\n' ) {
-                next.read = after;
-                next.line_length = line_len + 1;
-                sorter.push(next);
-            } else {
-                break (next.source_index, next.starts_at);
-            }
-        };
-        // empty the next line information into next_line, so that the borrow of source expires
-        for line in sorter {
-            next_line[line.source_index] = line.starts_at..line.starts_at+line.line_length;
-        }
-        // actually write the merged lines
-        if let Err(e) = write_all_vectored(&mut stdout, &ready_output) {
-            error("Error writing to", b"stdout", e, 4);
-        }
-
-        if let Some(line_length) = sources[needs_more].read_next_line(written) {
-            next_line[needs_more] = 0..line_length;
+        stdout.write_all(this_line).expect("write line");
+        next.starts_at += this_line.len();
+        #[cfg(feature="debug")]
+        eprintln!("sorter after: {:?}", &sorter);
+        if let Some(line_len) = after.iter().position(|&b| b == b'\n' ) {
+            next.read = after;
+            next.line_length = line_len + 1;
+            sorter.push(next);
         } else {
-            // everything printed, close file
-            sources.swap_remove(needs_more);
-            next_line.swap_remove(needs_more);
-            last_printed.set(sources.len());
+            // actually write the merged lines
+            if let Err(e) = write_all_vectored(&mut stdout, &ready_output) {
+                error("Error writing to", b"stdout", e, 4);
+            }
+            ready_output.clear();
+
+            if let Some(line_length) = sources[next.source_index].read_next_line(next.starts_at) {
+                next_line[next.source_index] = 0..line_length;
+            } else {
+                // everything printed, close file
+                sources.swap_remove(next.source_index);
+                next_line.swap_remove(next.source_index);
+                last_printed.set(sources.len());
+            }
         }
     }
 }
