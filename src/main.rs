@@ -204,12 +204,12 @@ fn main() {
                 source: i,
             });
         }
-        #[cfg(feature="debug")]
-        eprintln!("sorter before: {:?}", &sorter);
 
         // merge as many available lines as possible
         let mut ready_output = Vec::<IoSlice>::new();
         let (needs_more, written) = loop {
+            #[cfg(feature="debug")]
+            eprintln!("sorter before: {:?}", &sorter);
             let mut next = sorter.pop().unwrap();
             if next.source != last_printed {
                 ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
@@ -228,6 +228,8 @@ fn main() {
             #[cfg(feature="debug")]
             stdout.write_all(this_line).expect("write line");
             next.starts_at += this_line.len();
+            #[cfg(feature="debug")]
+            eprintln!("sorter after: {:?}", &sorter);
             if let Some(line_len) = after.iter().position(|&b| b == b'\n' ) {
                 next.read = after;
                 next.line_length = line_len + 1;
@@ -236,8 +238,6 @@ fn main() {
                 break (next.source, next.starts_at);
             }
         };
-        #[cfg(feature="debug")]
-        eprintln!("sorter after: {:?}", &sorter);
         // empty the next line information into next_line, so that the borrow of source expires
         for line in sorter {
             next_line[line.source] = line.starts_at..line.starts_at+line.line_length;
