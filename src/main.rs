@@ -11,6 +11,7 @@ use std::error::Error as _;
 use std::collections::BinaryHeap;
 use std::ops::Range;
 use std::cmp::{Ord, PartialOrd, Ordering};
+use std::cell::Cell;
 #[cfg(any(debug_assertions, feature="debug"))]
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
@@ -111,12 +112,17 @@ struct FirstLine<'a> {
     line_length: usize,
     /// offset of self.read in Source.buffer
     starts_at: usize,
-    /// index of the source
-    source: usize,
+    source_index: usize,
+    last_source: &'a Cell<usize>,
+}
+impl<'a> FirstLine<'a> {
+    fn line(&self) -> &'a [u8] {
+        &self.read[..self.line_length]
+    }
 }
 impl<'a> PartialEq for FirstLine<'a> {
     fn eq(&self,  other: &Self) -> bool {
-        &self.read[..self.line_length] == &other.read[..other.line_length]
+        self.line() == other.line()
     }
 }
 impl<'a> Eq for FirstLine<'a> {}
@@ -127,7 +133,17 @@ impl<'a> PartialOrd for FirstLine<'a> {
 }
 impl<'a> Ord for FirstLine<'a> {
     fn cmp(&self,  rhs: &Self) -> Ordering {
-        rhs.read[..rhs.line_length].cmp(&self.read[..self.line_length])
+        match self.line().cmp(rhs.line()) {
+            // invert because BinaryHeap is a max heap
+            Ordering::Less => Ordering::Greater,
+            Ordering::Greater => Ordering::Less,
+            // prefer continuing from the same file
+            Ordering::Equal if self.source_index == self.last_source.get() => Ordering::Greater,
+            Ordering::Equal if rhs.source_index == self.last_source.get() => Ordering::Less,
+            // make order predictable by falling back to path ordering
+            Ordering::Equal if self.source_index > rhs.source_index => Ordering::Greater,
+            Ordering::Equal => Ordering::Less,
+        }
     }
 }
 #[cfg(any(debug_assertions, feature="debug"))]
@@ -137,7 +153,7 @@ impl<'a> Debug for FirstLine<'a> {
             .field("line", &String::from_utf8_lossy(&self.read[..self.line_length]))
             .field("read_length", &self.read.len())
             .field("starts_at", &self.starts_at)
-            .field("source", &self.source)
+            .field("source_index", &self.source_index)
             .finish()
     }
 }
@@ -187,7 +203,7 @@ fn main() {
     }
 
     let mut first_print = true;
-    let mut last_printed = sources.len();
+    let last_printed = Cell::new(sources.len());
     let stdout = stdout();
     let mut stdout = stdout.lock();
     while ! sources.is_empty() {
@@ -201,7 +217,8 @@ fn main() {
                 read: &sources[i].buffer[line.start..sources[i].read],
                 line_length: line.end - line.start,
                 starts_at: line.start,
-                source: i,
+                source_index: i,
+                last_source: &last_printed,
             });
         }
 
@@ -211,15 +228,15 @@ fn main() {
             #[cfg(feature="debug")]
             eprintln!("sorter before: {:?}", &sorter);
             let mut next = sorter.pop().unwrap();
-            if next.source != last_printed {
+            if next.source_index != last_printed.get() {
                 ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
-                ready_output.push(IoSlice::new(&sources[next.source].path));
+                ready_output.push(IoSlice::new(&sources[next.source_index].path));
                 ready_output.push(IoSlice::new(b"\n"));
                 #[cfg(feature="debug")] {
                     write_all_vectored(&mut stdout, &ready_output).expect("write path");
                     ready_output.clear();
                 }
-                last_printed = next.source;
+                last_printed.set(next.source_index);
                 first_print = false;
             }
             let (this_line, after) = next.read.split_at(next.line_length);
@@ -235,12 +252,12 @@ fn main() {
                 next.line_length = line_len + 1;
                 sorter.push(next);
             } else {
-                break (next.source, next.starts_at);
+                break (next.source_index, next.starts_at);
             }
         };
         // empty the next line information into next_line, so that the borrow of source expires
         for line in sorter {
-            next_line[line.source] = line.starts_at..line.starts_at+line.line_length;
+            next_line[line.source_index] = line.starts_at..line.starts_at+line.line_length;
         }
         // actually write the merged lines
         if let Err(e) = write_all_vectored(&mut stdout, &ready_output) {
@@ -253,7 +270,7 @@ fn main() {
             // everything printed, close file
             sources.swap_remove(needs_more);
             next_line.swap_remove(needs_more);
-            last_printed = sources.len();
+            last_printed.set(sources.len());
         }
     }
 }
