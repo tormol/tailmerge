@@ -9,9 +9,8 @@ use std::os::wasi::ffi::OsStringExt;
 use std::io::{stderr, Write, Error as IoError, Read, stdout, IoSlice};
 use std::error::Error as _;
 use std::collections::BinaryHeap;
-use std::ops::Range;
 use std::cmp::{Ord, PartialOrd, Ordering};
-use std::cell::Cell;
+use std::cell::{RefCell, Ref, Cell};
 #[cfg(any(debug_assertions, feature="debug"))]
 use std::fmt::{Debug, Formatter, Result as FmtResult};
 
@@ -107,7 +106,7 @@ impl Debug for Source {
 
 struct FirstLine<'a> {
     /// borrows a Source.buffer[self.starts_at..Source.read]
-    read: &'a [u8],
+    source: Ref<'a, Source>,
     /// the first line is self.read[..self.line_length]
     line_length: usize,
     /// offset of self.read in Source.buffer
@@ -116,8 +115,8 @@ struct FirstLine<'a> {
     last_source: &'a Cell<usize>,
 }
 impl<'a> FirstLine<'a> {
-    fn line(&self) -> &'a [u8] {
-        &self.read[..self.line_length]
+    fn line(&self) -> &[u8] {
+        &self.source.buffer[self.starts_at..self.starts_at+self.line_length]
     }
 }
 impl<'a> PartialEq for FirstLine<'a> {
@@ -150,9 +149,10 @@ impl<'a> Ord for FirstLine<'a> {
 impl<'a> Debug for FirstLine<'a> {
     fn fmt(&self,  fmtr: &mut Formatter) -> FmtResult {
         fmtr.debug_struct("FirstLine")
-            .field("line", &String::from_utf8_lossy(&self.read[..self.line_length]))
-            .field("read_length", &self.read.len())
+            .field("line", &String::from_utf8_lossy(self.line()))
             .field("starts_at", &self.starts_at)
+            .field("read", &self.source.read)
+            .field("path", &String::from_utf8_lossy(&self.source.path))
             .field("source_index", &self.source_index)
             .finish()
     }
@@ -160,7 +160,7 @@ impl<'a> Debug for FirstLine<'a> {
 
 fn main() {
     // open files
-    let mut sources = Vec::<Source>::new();
+    let mut sources = Vec::<RefCell<Source>>::new();
     for arg in args_os().skip(1) {
         // open the file before converting the OsString to bytes
         let file_result = File::open(Path::new(&arg));
@@ -174,12 +174,12 @@ fn main() {
         let file = file_result.unwrap_or_else(|err| {
             error("Cannot open", &path, err, 2);
         });
-        sources.push(Source {
+        sources.push(RefCell::new(Source {
             path: path.into_boxed_slice(),
             file,
             buffer: vec![0; 1024*1024].into_boxed_slice(),
             read: 0,
-        });
+        }));
     }
 
     if sources.is_empty() {
@@ -192,16 +192,6 @@ fn main() {
         exit(1);
     }
 
-    let mut next_line: Vec::<Range<usize>> = vec![0..0; sources.len()];
-    for i in (0..sources.len()).rev() {
-        if let Some(line_len) = sources[i].read_next_line(0) {
-            next_line[i] = 0..line_len;
-        } else {
-            next_line.swap_remove(i);
-            sources.swap_remove(i);
-        }
-    }
-
     let mut first_print = true;
     let last_printed = Cell::new(sources.len());
     let stdout = stdout();
@@ -209,17 +199,17 @@ fn main() {
 
     #[cfg(feature="debug")]
     eprintln!("sources: {:?}", &sources);
-    #[cfg(feature="debug")]
-    eprintln!("next_line: {:?}", &next_line);
     let mut sorter = BinaryHeap::<FirstLine>::with_capacity(sources.len());
-    for (i, line) in next_line.iter_mut().enumerate() {
-        sorter.push(FirstLine {
-            read: &sources[i].buffer[line.start..sources[i].read],
-            line_length: line.end - line.start,
-            starts_at: line.start,
-            source_index: i,
-            last_source: &last_printed,
-        });
+    for (i, source) in sources.iter().enumerate() {
+        if let Some(line_length) = source.borrow_mut().read_next_line(0) {
+            sorter.push(FirstLine {
+                source: source.borrow(),
+                line_length: line_length,
+                starts_at: 0,
+                source_index: i,
+                last_source: &last_printed,
+            });
+        }
     }
 
     // merge as many available lines as possible
@@ -227,30 +217,32 @@ fn main() {
     while ! sources.is_empty() {
         #[cfg(feature="debug")]
         eprintln!("sorter before: {:?}", &sorter);
-        let mut next = sorter.pop().unwrap();
-        if next.source_index != last_printed.get() {
+
+        let FirstLine { line_length, starts_at, source_index, source, .. } = sorter.pop().unwrap();
+        if source_index != last_printed.get() {
             ready_output.push(IoSlice::new(&b"\n>>> "[first_print as usize..]));
-            ready_output.push(IoSlice::new(&sources[next.source_index].path));
+            ready_output.push(IoSlice::new(&source.path));
             ready_output.push(IoSlice::new(b"\n"));
             #[cfg(feature="debug")] {
                 write_all_vectored(&mut stdout, &ready_output).expect("write path");
                 ready_output.clear();
             }
-            last_printed.set(next.source_index);
+            last_printed.set(source_index);
             first_print = false;
         }
-        let (this_line, after) = next.read.split_at(next.line_length);
         #[cfg(not(feature="debug"))]
-        ready_output.push(IoSlice::new(this_line));
+        ready_output.push(IoSlice::new(&source.buffer[starts_at..starts_at+line_length]));
         #[cfg(feature="debug")]
-        stdout.write_all(this_line).expect("write line");
-        next.starts_at += this_line.len();
-        #[cfg(feature="debug")]
-        eprintln!("sorter after: {:?}", &sorter);
+        stdout.write_all(next.line()).expect("write line");
+        let after = &source.buffer[starts_at+line_length..source.read];
         if let Some(line_len) = after.iter().position(|&b| b == b'\n' ) {
-            next.read = after;
-            next.line_length = line_len + 1;
-            sorter.push(next);
+            sorter.push(FirstLine {
+                source,
+                line_length: line_len + 1,
+                starts_at: starts_at + line_length,
+                source_index,
+                last_source: &last_printed,
+            });
         } else {
             // actually write the merged lines
             if let Err(e) = write_all_vectored(&mut stdout, &ready_output) {
@@ -258,14 +250,20 @@ fn main() {
             }
             ready_output.clear();
 
-            if let Some(line_length) = sources[next.source_index].read_next_line(next.starts_at) {
-                next_line[next.source_index] = 0..line_length;
+            let mut source = sources[source_index].borrow_mut();
+            if let Some(line_length) = source.read_next_line(starts_at+line_length) {
+                sorter.push(FirstLine {
+                    source: sources[source_index].borrow(),
+                    line_length,
+                    starts_at: 0,
+                    source_index,
+                    last_source: &last_printed,
+                });
             } else {
-                // everything printed, close file
-                sources.swap_remove(next.source_index);
-                next_line.swap_remove(next.source_index);
                 last_printed.set(sources.len());
             }
         }
+        #[cfg(feature="debug")]
+        eprintln!("sorter after: {:?}", &sorter);
     }
 }
