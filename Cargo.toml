@@ -1,6 +1,8 @@
 [package]
 name = "logmerge"
 version = "0.1.0"
+description = "A program to merge files like tail -f"
+license = "LGPL-3.0-or-later"
 authors = ["Torbjørn Birch Moltu <t.b.moltu@lyse.net>"]
 edition = "2018"
 
