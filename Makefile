@@ -1,12 +1,12 @@
 CC?=gcc
 CFLAGS?=-Wall -Wextra -Wpedantic -std=c11 -g
 
-logmerger: logmerger.c
-	$(CC) -o logmerger logmerger.c $(CFLAGS)
+tailmerge: tailmerge.c
+	$(CC) -o tailmerge tailmerge.c $(CFLAGS)
 
 clean:
-	rm -f logmerger
+	rm -f tailmerge
 
-all: logmerger
+all: tailmerge
 
 .PHONY: clean all

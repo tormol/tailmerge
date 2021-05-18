@@ -1,4 +1,4 @@
-# LogMerger
+# tailmerge
 
 A simple command line utility for merging files the way `tail -f` does.
 It differs from `sort -m` in that the file name is printed above each block of lines from one file.
@@ -9,7 +9,7 @@ Lines from the same file are guarenteed to be printed in order.
 ```sh
 $ seq 1 6 > foo.lst
 $ seq 4 9 > bar.lst
-$ logmerger foo.lst bar.lst
+$ tailmerge foo.lst bar.lst
 >>> foo.lst
 1
 2

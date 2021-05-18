@@ -1,4 +1,4 @@
-/* logmerger - A program to merge files like tail -f
+/* tailmerge - A program to sort together files like tail -f
  * Copyright (C) 2021 Torbjørn Birch Moltu
  *
  * licenced under the terms of the GNU Lesser General Public License
@@ -28,7 +28,7 @@
 #include <sysexits.h> // EX_OK, EX_USAGE, EX_NOINPUT, EX_UNAVAILABLE, EX_IOERR
 
 const char *HELP_MESSAGE = "\
-Usage: log_merge file1 [file2]...\n\
+Usage: tailmerge file1 [file2]...\n\
 \n\
 \"Sorts\" the files but prints the file name above each group of lines from a file, like `tail -f`.\n\
 Files are merged by sorting the next unprinted line from each file,\n\
