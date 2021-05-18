@@ -36,12 +36,27 @@ $ rm foo.lst bar.lst
 
 * Because it doesn't need to sort the entire file, memory usage is reduced.
 * Uses vectored I/O to avoid copying lines while reducing the number of syscall.
+* TODO skip finding newlines when there is only a single file left.
 
 ## Limitations
 
 * Haven't been tested with files that aren't read in one go.
 * Haven't been tested with lines long enough to require growing the buffer.
 * Doesn't do locale-aware sorting.
+* Compares the entire line, which might be suboptimal if one only wants to sort by a timestamp.
+* Doesn't support numerical sort.
+
+## Variants
+
+This repository contains both a C version and a Rust version (called logmerge):
+
+The Rust version is completely safe, but this requires some redundant copying.  
+The C version avoids this, and most development will happen here.
+Where the Rust version will grow buffers to fit extremely long lines,
+the C version will instead only compare the first couple kilobytes of a line,
+which ensures predictable, bounded memory usage.
+
+Neither version have been tested outside of trivial cases.
 
 ## License
 
