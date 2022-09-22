@@ -4,9 +4,12 @@ CFLAGS?=-Wall -Wextra -Wpedantic -std=c11 -g
 tailmerge: tailmerge.c
 	$(CC) -o tailmerge tailmerge.c $(CFLAGS)
 
-clean:
-	rm -f tailmerge
+uring: uring.c
+	$(CC) -o uring uring.c $(CFLAGS) -Wno-pointer-arith
 
-all: tailmerge
+clean:
+	rm -f tailmerge uring
+
+all: tailmerge uring
 
 .PHONY: clean all
