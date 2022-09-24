@@ -103,7 +103,6 @@ struct uring_reader {
     struct io_uring_cqe* cqes;
     char* registered_buffer;
     int opening_files; // added files - completed opens
-    int cwd_fd; // for openat()
 };
 
 struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
@@ -166,14 +165,14 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
     restrictions[0].sqe_op = IORING_OP_OPENAT;
     restrictions[1].opcode = IORING_RESTRICTION_SQE_OP;
     restrictions[1].sqe_op = IORING_OP_READ_FIXED;
-    //checkerr(io_uring_register(ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 2), "restrict IO operations");
+    checkerr(io_uring_register(ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 2), "restrict IO operations");
 
     // use registered file descriptors
     int fds[files];
     for (int i=0; i<files; i++) {
-        fds[i] = i;
+        fds[i] = -1; // sparse
     }
-    //checkerr(io_uring_register(ring_fd, IORING_REGISTER_FILES, &fds, files), "register %d fd", files);
+    checkerr(io_uring_register(ring_fd, IORING_REGISTER_FILES, &fds, files), "register %d fds", files);
 
     // use one registered buffer for all files
     unsigned int buffers_sz = files * per_file_buffer_sz;
@@ -207,8 +206,7 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
         .cqes = cq_ptr + setup_params.cq_off.cqes,
         // fields for the program logic not solely tied to using the rings
         .registered_buffer = buffers,
-        .opening_files = 0,
-        .cwd_fd = checkerr(open(".", O_RDONLY | O_PATH | O_DIRECTORY), "open current directory as a fd")
+        .opening_files = 0
     };
     return r;
 }
@@ -226,8 +224,8 @@ void add_file_to_open(struct uring_reader* r, const char* file) {
     sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
     sqe->open_flags = O_RDONLY ; //| O_DIRECT;
     sqe->user_data = r->opening_files;
-    sqe->file_index = 0; //r->opening_files;
-    sqe->flags = 0; //IOSQE_FIXED_FILE;
+    sqe->file_index = r->opening_files+1;
+    sqe->flags = 0; // IOSQE_FIXED_FILE; // not supported and only for ->fd which I don't want anyway
 
     r->sring_array[r->opening_files] = r->opening_files;
     tail++;
@@ -268,7 +266,7 @@ void open_and_read_all(struct uring_reader* r) {
             struct io_uring_sqe *sqe = &r->sqes[cqe->user_data];
 
             checkerr_sys(cqe->res, "open %s through uring", (const char*)sqe->addr);
-            printf("%s opened (fd %d)\n", (const char*)sqe->addr, cqe->res);
+            printf("%s opened (internal offset %d)\n", (const char*)sqe->addr, sqe->file_index-1);
 
             r->opening_files--;
             head++;
