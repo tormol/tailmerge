@@ -28,7 +28,6 @@
 #include <sys/uio.h> // struct iovec
 #include <linux/io_uring.h>
 #include <sys/mman.h> // mmap()
-#include <asm-generic/mman.h> // MAP_UNINITIALIZED
 #include <sys/types.h> // more O_ flags
 #include <sys/stat.h>
 #include <fcntl.h> // open()
@@ -108,6 +107,7 @@ struct uring_reader {
 
     // fields for the program logic not solely tied to using the rings
     char* registered_buffer;
+    off_t* bytes_read;
     int open_files; // added files - completely read files
 };
 
@@ -214,10 +214,16 @@ void register_to_ring(struct uring_reader* r) {
 
     // use one registered buffer for all files
     unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
-    char* buffers = mmap((void*)0, buffers_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
+    // also allocate the list of bytes read at the end of it
+    unsigned int alloc_sz = buffers_sz + r->files * sizeof(off_t);
+    char* buffers = mmap(
+            (void*)0, alloc_sz,
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+            -1, 0
+    );
     if (buffers == MAP_FAILED)
     {
-        checkerr(-1, "mmap()ing %dKiB of buffers", buffers_sz/1024);
+        checkerr(-1, "mmap()ing %dKiB of buffers", alloc_sz/1024);
     }
     struct iovec buffer_vec = {.iov_base = buffers, .iov_len = buffers_sz};
     checkerr(
@@ -225,6 +231,7 @@ void register_to_ring(struct uring_reader* r) {
             "registor an already allocated buffer of %dKIB", buffers_sz/1024
     );
     r->registered_buffer = buffers;
+    r->bytes_read = (off_t*)&buffers[buffers_sz];
 
     // finally, enable the ring
     checkerr(io_uring_register(r->ring_fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0), "enable the ring");
@@ -351,7 +358,9 @@ void uring_read(struct uring_reader* r) {
         if (bytes_read == 0) {
             printf("%s finished\n", filename);
             r->open_files--;
+            continue;
         }
+        r->bytes_read[file] += bytes_read;
 
         char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
         char* newline_at = memchr(buffer, '\n', bytes_read);
@@ -360,7 +369,7 @@ void uring_read(struct uring_reader* r) {
         } else {
             *newline_at = '\0';
         }
-        printf("%d bytes read from %s; first line: %s\n", cqe->res, filename, buffer);
+        printf("%d bytes read from %s; first line: %s\n", bytes_read, filename, buffer);
 
         // and read more
         unsigned int index = stail & *r->sring_mask;
@@ -370,7 +379,7 @@ void uring_read(struct uring_reader* r) {
         sqe->flags = IOSQE_FIXED_FILE;
         sqe->addr = (size_t)&r->registered_buffer[file*r->per_file_buffer_sz];
         sqe->len = r->per_file_buffer_sz;
-        sqe->off = 0;
+        sqe->off = r->bytes_read[file];
         sqe->buf_index = 0;
         sqe->user_data = file;
         r->sring_array[index] = index;
