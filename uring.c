@@ -299,7 +299,6 @@ void uring_open_files
     }
     /* Update the tail */
     io_uring_smp_store_release(r->sring_tail, tail);
-    printf("before half submit stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     int to_consume = (r->files/2)*2;
     do
     {
@@ -307,10 +306,8 @@ void uring_open_files
                 io_uring_enter(r->ring_fd, to_consume, 1, 0),
                 "io_uring_enter()"
         );
-        printf("io_uring_enter() consumed %d of %d OPENAT+READ_FIXED sqes\n", consumed_now, to_consume);
         to_consume -= consumed_now;
     } while (to_consume > 0);
-    printf("after half submit stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
 
     /* Add our submission queue entry to the tail of the SQE ring buffer */
     tail = *r->sring_tail;
@@ -349,14 +346,11 @@ void uring_read(struct uring_reader* r) {
     * causes the io_uring_enter() call to wait until min_complete
     * (the 3rd param) events complete.
     * */
-    printf("before GETEVNTS stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     int consumed_now = checkerr(
             io_uring_enter(r->ring_fd, r->to_submit, 1, IORING_ENTER_GETEVENTS),
             "io_uring_enter()"
     );
-    printf("io_uring_enter() consumed %d of %d sqes\n", consumed_now, r->to_submit);
     r->to_submit -= consumed_now;
-    printf("after GETEVENTS stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
 
     /* Read barrier */
     unsigned int chead = io_uring_smp_load_acquire(r->cring_head);
