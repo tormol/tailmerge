@@ -120,7 +120,7 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
         setup_params.flags |= IORING_SETUP_COOP_TASKRUN; // don't signal on completion
     #endif
     int ring_fd = checkerr(io_uring_setup(files, &setup_params), "create ring");
-    printf("Created uring with %d sqes and %d cqes.\n", setup_params.sq_entries, setup_params.cq_entries);
+    printf("Got uring with %d sqes and %d cqes (wanted %d).\n", setup_params.sq_entries, setup_params.cq_entries, files);
 
     // create rings (copied from example in man io_uring)
     int sring_sz = setup_params.sq_off.array + setup_params.sq_entries * sizeof(unsigned);
@@ -285,19 +285,19 @@ void open_and_read_all(struct uring_reader* r) {
 
     // read from all
     unsigned int tail = *r->sring_tail;
-    for (int i=0; i<r->files; i++) {
+    for (int file=0; file<r->files; file++) {
         unsigned int index = tail & *r->sring_mask;
-        assert((int)index == i);
-        struct io_uring_sqe *sqe = &r->sqes[i];
+        printf("reading file %d index %d (ring mask %zx)\n", file, index, (size_t)r->sring_mask);
+        struct io_uring_sqe *sqe = &r->sqes[index];
         sqe->opcode = IORING_OP_READ_FIXED;
-        sqe->fd = i;
+        sqe->fd = file;
         sqe->flags = IOSQE_FIXED_FILE;
-        sqe->addr = (size_t)&r->registered_buffer[i*r->per_file_buffer_sz];
+        sqe->addr = (size_t)&r->registered_buffer[file*r->per_file_buffer_sz];
         sqe->len = r->per_file_buffer_sz;
         sqe->off = 0;
         sqe->buf_index = 0;
-        sqe->user_data = i;
-        r->sring_array[i] = i;
+        sqe->user_data = file;
+        r->sring_array[index] = index;
         tail++;
     }
     /* Update the tail */
@@ -320,14 +320,13 @@ void open_and_read_all(struct uring_reader* r) {
     while (head != *r->cring_tail) {
         /* Get the entry */
         struct io_uring_cqe *cqe = &r->cqes[head & (*r->cring_mask)];
-        struct io_uring_sqe *sqe = &r->sqes[cqe->user_data];
         checkerr_sys(
                 cqe->res,
                 "read up to %d bytes from %s through uring",
                 r->per_file_buffer_sz,
                 r->filenames[cqe->user_data]
         );
-        char* buffer = &r->registered_buffer[sqe->user_data * r->per_file_buffer_sz];
+        char* buffer = &r->registered_buffer[cqe->user_data * r->per_file_buffer_sz];
         char* newline_at = memchr(buffer, '\n', r->per_file_buffer_sz);
         if (newline_at == NULL) {
             memcpy(&buffer[16], " ...\0", 5);
