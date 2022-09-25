@@ -108,6 +108,7 @@ struct uring_reader {
     // fields for the program logic not solely tied to using the rings
     char* registered_buffer;
     off_t* bytes_read;
+    int* lines_read;
     int open_files; // added files - completely read files
 };
 
@@ -214,7 +215,7 @@ void register_to_ring(struct uring_reader* r) {
     // use one registered buffer for all files
     unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
     // also allocate the list of bytes read at the end of it
-    unsigned int alloc_sz = buffers_sz + r->files * sizeof(off_t);
+    unsigned int alloc_sz = buffers_sz + r->files * (sizeof(off_t)+sizeof(int));
     char* buffers = mmap(
             (void*)0, alloc_sz,
             PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
@@ -231,6 +232,7 @@ void register_to_ring(struct uring_reader* r) {
     );
     r->registered_buffer = buffers;
     r->bytes_read = (off_t*)&buffers[buffers_sz];
+    r->lines_read = (int*)&buffers[buffers_sz+r->files*sizeof(off_t)];
 
     // finally, enable the ring
     checkerr(io_uring_register(r->ring_fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0), "enable the ring");
@@ -320,6 +322,26 @@ void uring_open_files
     r->to_submit = (r->files - r->files/2)*2;
 }
 
+void handle_read(struct uring_reader* r, int file, int bytes) {
+    char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
+    char* newline_at = memchr(buffer, '\n', bytes);
+    if (newline_at == NULL) {
+        memcpy(&buffer[16], " ...\0", 5);
+    } else {
+        *newline_at = '\0';
+    }
+    printf(
+            "%d bytes read from %s: (rest of) line %d: %s\n",
+            bytes, r->filenames[file], r->lines_read[file], buffer
+    );
+    while (newline_at != NULL) {
+        r->lines_read[file]++;
+        bytes -= (int)(newline_at+1-buffer);
+        buffer = newline_at + 1;
+        newline_at = memchr(buffer, '\n', bytes);
+    }
+}
+
 void uring_read(struct uring_reader* r) {
     /*
     * Tell the kernel we have submitted events with the io_uring_enter()
@@ -369,14 +391,7 @@ void uring_read(struct uring_reader* r) {
         }
         r->bytes_read[file] += bytes_read;
 
-        char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
-        char* newline_at = memchr(buffer, '\n', bytes_read);
-        if (newline_at == NULL) {
-            memcpy(&buffer[16], " ...\0", 5);
-        } else {
-            *newline_at = '\0';
-        }
-        printf("%d bytes read from %s; first line: %s\n", bytes_read, filename, buffer);
+        handle_read(r, file, bytes_read);
 
         // and read more
         unsigned int index = stail & *r->sring_mask;
