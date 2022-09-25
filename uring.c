@@ -116,7 +116,7 @@ void create_ring(struct uring_reader* r) {
     struct io_uring_params setup_params = {0};
     int capacity = r->files;
     // need one extra to fit 2*the bigger half when odd
-    if (capacity & 1 != 0) {
+    if ((capacity & 1) != 0) {
         capacity++;
     }
     setup_params.sq_entries = setup_params.cq_entries = capacity;
@@ -191,29 +191,23 @@ void create_ring(struct uring_reader* r) {
 
 void register_to_ring(struct uring_reader* r) {
     // restrict to open and read
-    struct io_uring_restriction restrictions[5] = {{0}};
+    struct io_uring_restriction restrictions[3] = {{0}};
     restrictions[0].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
-    restrictions[0].sqe_op = IOSQE_IO_LINK;
-    restrictions[1].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
-    restrictions[1].sqe_op = IOSQE_CQE_SKIP_SUCCESS;
-    restrictions[2].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
-    restrictions[2].sqe_op = IOSQE_FIXED_FILE;
-    restrictions[3].opcode = IORING_RESTRICTION_SQE_OP;
-    restrictions[3].sqe_op = IORING_OP_OPENAT;
-    restrictions[4].opcode = IORING_RESTRICTION_SQE_OP;
-    restrictions[4].sqe_op = IORING_OP_READ_FIXED;
-    // checkerr(
-    //         io_uring_register(r->ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 5),
-    //         "restrict IO operations"
-    // );
+    restrictions[0].sqe_op = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS | IOSQE_FIXED_FILE;
+    restrictions[1].opcode = IORING_RESTRICTION_SQE_OP;
+    restrictions[1].sqe_op = IORING_OP_OPENAT;
+    restrictions[2].opcode = IORING_RESTRICTION_SQE_OP;
+    restrictions[2].sqe_op = IORING_OP_READ_FIXED;
+    checkerr(
+            io_uring_register(r->ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 3),
+            "restrict IO operations"
+    );
 
     // use registered file descriptors
-    int fds[r->files];
-    for (int i=0; i<r->files; i++) {
-        fds[i] = -1; // sparse
-    }
+    int* fds = (int*)r->cqes; // borrow it; it will be overwritten when used
+    memset(fds, -1/*sparse*/, r->files*sizeof(int));
     checkerr(
-            io_uring_register(r->ring_fd, IORING_REGISTER_FILES, &fds, r->files),
+            io_uring_register(r->ring_fd, IORING_REGISTER_FILES, fds, r->files),
             "register %d fds", r->files
     );
 
