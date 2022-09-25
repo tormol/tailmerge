@@ -256,7 +256,7 @@ void open_and_read(struct uring_reader* r, int file, unsigned int* local_tail) {
     sqe->addr = (size_t)r->filenames[file];
     sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
     sqe->open_flags = O_RDONLY; //| O_DIRECT;
-    sqe->user_data = !file; // negative to distinguish from reads
+    sqe->user_data = file + r->files; // distinguish from reads
     sqe->file_index = file+1;
     // IOSQE_FIXED_FILE is not supported, and only matters for ->fd which I don't want anyway
     sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
@@ -339,8 +339,12 @@ void uring_read(struct uring_reader* r) {
     while (chead != *r->cring_tail) {
         /* Get the entry */
         struct io_uring_cqe *cqe = &r->cqes[chead & (*r->cring_mask)];
-        if ((int)cqe->user_data < 0) {
-            checkerr_sys(cqe->res, "open %s through uring", r->filenames[!cqe->user_data]);
+        chead++;
+
+        if ((int)cqe->user_data >= r->files) {
+            int file = cqe->user_data - r->files;
+            checkerr_sys(cqe->res, "open %s through uring", r->filenames[file]);
+            continue; // in case link gets broken or something
         } else {
             checkerr_sys(
                     cqe->res,
@@ -349,7 +353,6 @@ void uring_read(struct uring_reader* r) {
                     r->filenames[cqe->user_data]
             );
         }
-        chead++;
 
         // we only get successful completion events from reads
         int file = cqe->user_data;
