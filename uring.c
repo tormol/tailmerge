@@ -87,11 +87,14 @@ int io_uring_enter(int ring_fd, unsigned int to_submit, unsigned int min_complet
 #define io_uring_smp_load_acquire(p) atomic_load_explicit((p), memory_order_acquire)
 
 struct uring_reader {
+    // inputs
     int files;
     int per_file_buffer_sz;
     const char* const* filenames;
+
     struct io_uring_params params;
     int ring_fd;
+    int to_submit;
     void* sq_ptr;
     void* cq_ptr;
     struct io_uring_sqe* sqes;
@@ -102,14 +105,16 @@ struct uring_reader {
     atomic_uint* cring_tail;
     unsigned int* cring_mask;
     struct io_uring_cqe* cqes;
+
+    // fields for the program logic not solely tied to using the rings
     char* registered_buffer;
-    int opening_files; // added files - completed opens
+    int open_files; // added files - completely read files
 };
 
-struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
+void create_ring(struct uring_reader* r) {
     // create inactive ring
     struct io_uring_params setup_params = {0};
-    setup_params.sq_entries = setup_params.cq_entries = files;
+    setup_params.sq_entries = setup_params.cq_entries = r->files;
     //setup_params.flags |= IORING_SETUP_IOPOLL; // busy-wait, requires O_DIRECT
     setup_params.flags |= IORING_SETUP_CQSIZE; // use .cq_entries instead of the separate argument
     setup_params.flags |= IORING_SETUP_R_DISABLED; // I want to limit to open, read and write
@@ -119,8 +124,11 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
     #ifdef IORING_SETUP_COOP_TASKRUN // I don't have 5.19 yet, and not required
         setup_params.flags |= IORING_SETUP_COOP_TASKRUN; // don't signal on completion
     #endif
-    int ring_fd = checkerr(io_uring_setup(files, &setup_params), "create ring");
-    printf("Got uring with %d sqes and %d cqes (wanted %d).\n", setup_params.sq_entries, setup_params.cq_entries, files);
+    int ring_fd = checkerr(io_uring_setup(r->files, &setup_params), "create ring");
+    printf(
+            "Got uring with %d sqes and %d cqes (wanted %d).\n",
+            setup_params.sq_entries, setup_params.cq_entries, r->files
+    );
 
     // create rings (copied from example in man io_uring)
     int sring_sz = setup_params.sq_off.array + setup_params.sq_entries * sizeof(unsigned);
@@ -161,133 +169,201 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
     }
     // end of mostly copied code
 
+    r->params = setup_params;
+    r->ring_fd = ring_fd;
+    r->sq_ptr = sq_ptr;
+    r->cq_ptr = cq_ptr;
+    r->sqes = sqes;
+    /* Save useful fields for later easy reference */
+    r->sring_tail = sq_ptr + setup_params.sq_off.tail;
+    r->sring_mask = sq_ptr + setup_params.sq_off.ring_mask;
+    r->sring_array = sq_ptr + setup_params.sq_off.array;
+    r->cring_head = cq_ptr + setup_params.cq_off.head;
+    r->cring_tail = cq_ptr + setup_params.cq_off.tail;
+    r->cring_mask = cq_ptr + setup_params.cq_off.ring_mask;
+    r->cqes = cq_ptr + setup_params.cq_off.cqes;
+}
+
+void register_to_ring(struct uring_reader* r) {
     // restrict to open and read
-    struct io_uring_restriction restrictions[3] = {{0}};
+    struct io_uring_restriction restrictions[5] = {{0}};
     restrictions[0].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
-    restrictions[0].sqe_op = IOSQE_FIXED_FILE;
-    restrictions[1].opcode = IORING_RESTRICTION_SQE_OP;
-    restrictions[1].sqe_op = IORING_OP_OPENAT;
-    restrictions[2].opcode = IORING_RESTRICTION_SQE_OP;
-    restrictions[2].sqe_op = IORING_OP_READ_FIXED;
-    checkerr(io_uring_register(ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 3), "restrict IO operations");
+    restrictions[0].sqe_op = IOSQE_IO_LINK;
+    restrictions[1].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
+    restrictions[1].sqe_op = IOSQE_CQE_SKIP_SUCCESS;
+    restrictions[2].opcode = IORING_RESTRICTION_SQE_FLAGS_ALLOWED;
+    restrictions[2].sqe_op = IOSQE_FIXED_FILE;
+    restrictions[3].opcode = IORING_RESTRICTION_SQE_OP;
+    restrictions[3].sqe_op = IORING_OP_OPENAT;
+    restrictions[4].opcode = IORING_RESTRICTION_SQE_OP;
+    restrictions[4].sqe_op = IORING_OP_READ_FIXED;
+    // checkerr(
+    //         io_uring_register(r->ring_fd, IORING_REGISTER_RESTRICTIONS, &restrictions, 5),
+    //         "restrict IO operations"
+    // );
 
     // use registered file descriptors
-    int fds[files];
-    for (int i=0; i<files; i++) {
+    int fds[r->files];
+    for (int i=0; i<r->files; i++) {
         fds[i] = -1; // sparse
     }
-    checkerr(io_uring_register(ring_fd, IORING_REGISTER_FILES, &fds, files), "register %d fds", files);
+    checkerr(
+            io_uring_register(r->ring_fd, IORING_REGISTER_FILES, &fds, r->files),
+            "register %d fds", r->files
+    );
 
     // use one registered buffer for all files
-    unsigned int buffers_sz = files * per_file_buffer_sz;
+    unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
     char* buffers = mmap((void*)0, buffers_sz, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS | MAP_UNINITIALIZED, -1, 0);
     if (buffers == MAP_FAILED)
     {
         checkerr(-1, "mmap()ing %dKiB of buffers", buffers_sz/1024);
     }
     struct iovec buffer_vec = {.iov_base = buffers, .iov_len = buffers_sz};
-    checkerr(io_uring_register(ring_fd, IORING_REGISTER_BUFFERS, &buffer_vec, 1),
-             "registor an already allocated buffer of %dKIB", buffers_sz/1024);
+    checkerr(
+            io_uring_register(r->ring_fd, IORING_REGISTER_BUFFERS, &buffer_vec, 1),
+            "registor an already allocated buffer of %dKIB", buffers_sz/1024
+    );
+    r->registered_buffer = buffers;
 
     // finally, enable the ring
-    checkerr(io_uring_register(ring_fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0), "enable the ring");
-
-    struct uring_reader r = {
-        .files = files,
-        .per_file_buffer_sz = per_file_buffer_sz,
-        .filenames = NULL,
-        .params = setup_params,
-        .ring_fd = ring_fd,
-        .sq_ptr = sq_ptr,
-        .cq_ptr = cq_ptr,
-        .sqes = sqes,
-        /* Save useful fields for later easy reference */
-        .sring_tail = sq_ptr + setup_params.sq_off.tail,
-        .sring_mask = sq_ptr + setup_params.sq_off.ring_mask,
-        .sring_array = sq_ptr + setup_params.sq_off.array,
-        .cring_head = cq_ptr + setup_params.cq_off.head,
-        .cring_tail = cq_ptr + setup_params.cq_off.tail,
-        .cring_mask = cq_ptr + setup_params.cq_off.ring_mask,
-        .cqes = cq_ptr + setup_params.cq_off.cqes,
-        // fields for the program logic not solely tied to using the rings
-        .registered_buffer = buffers,
-        .opening_files = 0
-    };
-    return r;
+    checkerr(io_uring_register(r->ring_fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0), "enable the ring");
 }
 
-void add_files_to_open(struct uring_reader* r, const char* const* files) {
-    r->filenames = files;
-    /* Add our submission queue entry to the tail of the SQE ring buffer */
-    unsigned int tail = *r->sring_tail;
-    for (int i=0; i<r->files; i++) {
-        unsigned int index = tail & *r->sring_mask;
-        assert((int)index == r->opening_files);
-        struct io_uring_sqe *sqe = &r->sqes[r->opening_files];
-        /* Fill in the parameters required for the read or write operation */
-        sqe->opcode = IORING_OP_OPENAT;
-        sqe->fd = AT_FDCWD;
-        sqe->addr = (size_t)files[i];
-        sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
-        sqe->open_flags = O_RDONLY ; //| O_DIRECT;
-        sqe->user_data = r->opening_files;
-        sqe->file_index = r->opening_files+1;
-        sqe->flags = 0; // IOSQE_FIXED_FILE is not supported, and only for ->fd which I don't want anyway
+void open_and_read(struct uring_reader* r, int file, unsigned int* local_tail) {
+    // The number of operations an io_uring can have in progress is
+    // not limited to the submission queue size.
+    // Using registered files descriptors means we don't need to wait for the open
+    // to complete to know the file descriptor to use for reads.
+    // Therefore the first read can be submitted at the same time as the open.
+    // When opening to a registererd fd succeeds, the completion event
+    // provides no additional information. Therefore we can use SKIP_SUCCESS,
+    // which means there will never be more than one completion per files.
+    // This means a completion queue of size files is enough.
 
-        r->sring_array[r->opening_files] = r->opening_files;
-        tail++;
-        r->opening_files++;
+    /* Add our submission queue entry to the tail of the SQE ring buffer */
+    unsigned int index = *local_tail & *r->sring_mask;
+    struct io_uring_sqe *sqe = &r->sqes[index];
+    sqe->opcode = IORING_OP_OPENAT;
+    sqe->fd = AT_FDCWD;
+    sqe->addr = (size_t)r->filenames[file];
+    sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
+    sqe->open_flags = O_RDONLY; //| O_DIRECT;
+    sqe->user_data = !file; // negative to distinguish from reads
+    sqe->file_index = file+1;
+    // IOSQE_FIXED_FILE is not supported, and only matters for ->fd which I don't want anyway
+    sqe->flags = IOSQE_IO_LINK | IOSQE_CQE_SKIP_SUCCESS;
+    r->sring_array[index] = index;
+    *local_tail = *local_tail+1;
+    r->open_files++;
+
+    index = *local_tail & *r->sring_mask;
+    sqe = &r->sqes[index];
+    sqe->opcode = IORING_OP_READ_FIXED;
+    sqe->fd = file;
+    sqe->flags = IOSQE_FIXED_FILE;
+    sqe->addr = (size_t)&r->registered_buffer[file*r->per_file_buffer_sz];
+    sqe->len = r->per_file_buffer_sz;
+    sqe->off = 0;
+    sqe->buf_index = 0;
+    sqe->user_data = file;
+    r->sring_array[index] = index;
+    *local_tail = *local_tail+1;
+}
+
+/// Create uring and submit open & initial read for all files.
+/// r is filled in by this function and can be passed in uninitialized.
+void uring_open_files
+(struct uring_reader* r, int files, const char* const* filenames, int per_file_buffer_sz) {
+    memset(r, 0, sizeof(struct uring_reader));
+    r->files = files;
+    r->filenames = filenames;
+    r->per_file_buffer_sz = per_file_buffer_sz;
+
+    create_ring(r);
+    register_to_ring(r);
+    r->filenames = filenames;
+
+    unsigned int tail = *r->sring_tail;
+    for (int i = 0; i < r->files/2; i++) {
+        open_and_read(r, i, &tail);
     }
     /* Update the tail */
     io_uring_smp_store_release(r->sring_tail, tail);
-}
-
-void open_and_read_all(struct uring_reader* r) {
-    // not sure if consumed mean submissions not rejected, or submissions accepted now, or submission completed.
-    // implementing the first
-    int to_consume = r->opening_files;
-    while (r->opening_files > 0)
+    int to_consume = (r->files/2)*2;
+    do
     {
-        /*
-        * Tell the kernel we have submitted events with the io_uring_enter()
-        * system call. We also pass in the IOURING_ENTER_GETEVENTS flag which
-        * causes the io_uring_enter() call to wait until min_complete
-        * (the 3rd param) events complete.
-        * */
         int consumed_now = checkerr(
-                io_uring_enter(r->ring_fd, to_consume, 1, IORING_ENTER_GETEVENTS),
+                io_uring_enter(r->ring_fd, to_consume, 1, 0),
                 "io_uring_enter()"
         );
-        printf("io_uring_enter() consumed %d of %d OPENAT sqes\n", consumed_now, to_consume);
+        printf("io_uring_enter() consumed %d of %d OPENAT+READ_FIXED sqes\n", consumed_now, to_consume);
         to_consume -= consumed_now;
+    } while (to_consume > 0);
 
-        /* Read barrier */
-        unsigned int head = io_uring_smp_load_acquire(r->cring_head);
-        /*
-        * Remember, this is a ring buffer. If head == tail, it means that the
-        * buffer is empty.
-        * */
-        while (head != *r->cring_tail) {
-            /* Get the entry */
-            struct io_uring_cqe *cqe = &r->cqes[head & (*r->cring_mask)];
-            struct io_uring_sqe *sqe = &r->sqes[cqe->user_data];
+    /* Add our submission queue entry to the tail of the SQE ring buffer */
+    tail = *r->sring_tail;
+    for (int i = r->files/2; i < r->files; i++) {
+        open_and_read(r, i, &tail);
+    }
+    /* Update the tail */
+    io_uring_smp_store_release(r->sring_tail, tail);
+    r->to_submit = (r->files - r->files/2)*2;
+}
 
-            checkerr_sys(cqe->res, "open %s through uring", (const char*)sqe->addr);
-            printf("%s opened (internal offset %d)\n", (const char*)sqe->addr, sqe->file_index-1);
+void uring_read(struct uring_reader* r) {
+    /*
+    * Tell the kernel we have submitted events with the io_uring_enter()
+    * system call. We also pass in the IOURING_ENTER_GETEVENTS flag which
+    * causes the io_uring_enter() call to wait until min_complete
+    * (the 3rd param) events complete.
+    * */
+    int consumed_now = checkerr(
+            io_uring_enter(r->ring_fd, r->to_submit, 1, IORING_ENTER_GETEVENTS),
+            "io_uring_enter()"
+    );
+    printf("io_uring_enter() consumed %d of %d sqes\n", consumed_now, r->to_submit);
+    r->to_submit -= consumed_now;
 
-            r->opening_files--;
-            head++;
+    /* Read barrier */
+    unsigned int chead = io_uring_smp_load_acquire(r->cring_head);
+    unsigned int stail = *r->sring_tail;
+    /* Remember, this is a ring buffer. If head == tail, it means that the  buffer is empty. */
+    while (chead != *r->cring_tail) {
+        /* Get the entry */
+        struct io_uring_cqe *cqe = &r->cqes[chead & (*r->cring_mask)];
+        if ((int)cqe->user_data < 0) {
+            checkerr_sys(cqe->res, "open %s through uring", r->filenames[!cqe->user_data]);
+        } else {
+            checkerr_sys(
+                    cqe->res,
+                    "read up to %d bytes from %s through uring",
+                    r->per_file_buffer_sz,
+                    r->filenames[cqe->user_data]
+            );
+        }
+        chead++;
+
+        // we only get successful completion events from reads
+        int file = cqe->user_data;
+        int bytes_read = cqe->res;
+        const char* filename = r->filenames[file];
+        if (bytes_read == 0) {
+            printf("%s finished\n", filename);
+            r->open_files--;
         }
 
-        /* Write barrier so that update to the head are made visible */
-        io_uring_smp_store_release(r->cring_head, head);
-    }
+        char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
+        char* newline_at = memchr(buffer, '\n', bytes_read);
+        if (newline_at == NULL) {
+            memcpy(&buffer[16], " ...\0", 5);
+        } else {
+            *newline_at = '\0';
+        }
+        printf("%d bytes read from %s; first line: %s\n", cqe->res, filename, buffer);
 
-    // read from all
-    unsigned int tail = *r->sring_tail;
-    for (int file=0; file<r->files; file++) {
-        unsigned int index = tail & *r->sring_mask;
-        printf("reading file %d index %d (ring mask %zx)\n", file, index, (size_t)r->sring_mask);
+        // and read more
+        unsigned int index = stail & *r->sring_mask;
         struct io_uring_sqe *sqe = &r->sqes[index];
         sqe->opcode = IORING_OP_READ_FIXED;
         sqe->fd = file;
@@ -298,46 +374,13 @@ void open_and_read_all(struct uring_reader* r) {
         sqe->buf_index = 0;
         sqe->user_data = file;
         r->sring_array[index] = index;
-        tail++;
-    }
-    /* Update the tail */
-    io_uring_smp_store_release(r->sring_tail, tail);
-
-    // and submit again
-    // since we're waiting for all to complete, that requires all to be submitted
-    int consumed = checkerr(
-            io_uring_enter(r->ring_fd, r->files, r->files, IORING_ENTER_GETEVENTS),
-            "io_uring_enter()"
-    );
-    printf("io_uring_enter() consumed %d of %d READ_FIXED sqes\n", consumed, r->files);
-
-    /* Read barrier */
-    unsigned int head = io_uring_smp_load_acquire(r->cring_head);
-    /*
-    * Remember, this is a ring buffer. If head == tail, it means that the
-    * buffer is empty.
-    * */
-    while (head != *r->cring_tail) {
-        /* Get the entry */
-        struct io_uring_cqe *cqe = &r->cqes[head & (*r->cring_mask)];
-        checkerr_sys(
-                cqe->res,
-                "read up to %d bytes from %s through uring",
-                r->per_file_buffer_sz,
-                r->filenames[cqe->user_data]
-        );
-        char* buffer = &r->registered_buffer[cqe->user_data * r->per_file_buffer_sz];
-        char* newline_at = memchr(buffer, '\n', r->per_file_buffer_sz);
-        if (newline_at == NULL) {
-            memcpy(&buffer[16], " ...\0", 5);
-        } else {
-            *newline_at = '\0';
-        }
-        printf("%d bytes read from %s; first line: %s\n", cqe->res, r->filenames[cqe->user_data], buffer);
-        head++;
+        r->to_submit++;
+        stail++;
     }
     /* Write barrier so that update to the head are made visible */
-    io_uring_smp_store_release(r->cring_head, head);
+    io_uring_smp_store_release(r->cring_head, chead);
+    /* Update the tail */
+    io_uring_smp_store_release(r->sring_tail, stail);
 }
 
 int main(int argc, const char* const* argv) {
@@ -346,9 +389,11 @@ int main(int argc, const char* const* argv) {
         return 1;
     }
 
-    struct uring_reader r = setup_ring(argc-1, 16*1024);
-    add_files_to_open(&r, &argv[1]);
-    open_and_read_all(&r);
+    struct uring_reader r;
+    uring_open_files(&r, argc-1, &argv[1], 16*1024);
+    while (r.open_files > 0) {
+        uring_read(&r);
+    }
 
     close(r.ring_fd);
     return 0;
