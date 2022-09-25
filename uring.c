@@ -89,6 +89,7 @@ int io_uring_enter(int ring_fd, unsigned int to_submit, unsigned int min_complet
 struct uring_reader {
     int files;
     int per_file_buffer_sz;
+    const char* const* filenames;
     struct io_uring_params params;
     int ring_fd;
     void* sq_ptr;
@@ -119,6 +120,7 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
         setup_params.flags |= IORING_SETUP_COOP_TASKRUN; // don't signal on completion
     #endif
     int ring_fd = checkerr(io_uring_setup(files, &setup_params), "create ring");
+    printf("Created uring with %d sqes and %d cqes.\n", setup_params.sq_entries, setup_params.cq_entries);
 
     // create rings (copied from example in man io_uring)
     int sring_sz = setup_params.sq_off.array + setup_params.sq_entries * sizeof(unsigned);
@@ -193,6 +195,7 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
     struct uring_reader r = {
         .files = files,
         .per_file_buffer_sz = per_file_buffer_sz,
+        .filenames = NULL,
         .params = setup_params,
         .ring_fd = ring_fd,
         .sq_ptr = sq_ptr,
@@ -213,28 +216,30 @@ struct uring_reader setup_ring(int files, int per_file_buffer_sz) {
     return r;
 }
 
-void add_file_to_open(struct uring_reader* r, const char* file) {
+void add_files_to_open(struct uring_reader* r, const char* const* files) {
+    r->filenames = files;
     /* Add our submission queue entry to the tail of the SQE ring buffer */
     unsigned int tail = *r->sring_tail;
-    unsigned int index = tail & *r->sring_mask;
-    assert((int)index == r->opening_files);
-    struct io_uring_sqe *sqe = &r->sqes[r->opening_files];
-    /* Fill in the parameters required for the read or write operation */
-    sqe->opcode = IORING_OP_OPENAT;
-    sqe->fd = AT_FDCWD;
-    sqe->addr = (size_t)file;
-    sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
-    sqe->open_flags = O_RDONLY ; //| O_DIRECT;
-    sqe->user_data = r->opening_files;
-    sqe->file_index = r->opening_files+1;
-    sqe->flags = 0; // IOSQE_FIXED_FILE is not supported, and only for ->fd which I don't want anyway
+    for (int i=0; i<r->files; i++) {
+        unsigned int index = tail & *r->sring_mask;
+        assert((int)index == r->opening_files);
+        struct io_uring_sqe *sqe = &r->sqes[r->opening_files];
+        /* Fill in the parameters required for the read or write operation */
+        sqe->opcode = IORING_OP_OPENAT;
+        sqe->fd = AT_FDCWD;
+        sqe->addr = (size_t)files[i];
+        sqe->off = S_IRUSR; // mode_t, doesn't matter siince we're opening readonly
+        sqe->open_flags = O_RDONLY ; //| O_DIRECT;
+        sqe->user_data = r->opening_files;
+        sqe->file_index = r->opening_files+1;
+        sqe->flags = 0; // IOSQE_FIXED_FILE is not supported, and only for ->fd which I don't want anyway
 
-    r->sring_array[r->opening_files] = r->opening_files;
-    tail++;
+        r->sring_array[r->opening_files] = r->opening_files;
+        tail++;
+        r->opening_files++;
+    }
     /* Update the tail */
     io_uring_smp_store_release(r->sring_tail, tail);
-
-    r->opening_files++;
 }
 
 void open_and_read_all(struct uring_reader* r) {
@@ -250,7 +255,7 @@ void open_and_read_all(struct uring_reader* r) {
         * (the 3rd param) events complete.
         * */
         int consumed_now = checkerr(
-                io_uring_enter(r->ring_fd, to_consume, r->opening_files, IORING_ENTER_GETEVENTS),
+                io_uring_enter(r->ring_fd, to_consume, 1, IORING_ENTER_GETEVENTS),
                 "io_uring_enter()"
         );
         printf("io_uring_enter() consumed %d of %d OPENAT sqes\n", consumed_now, to_consume);
@@ -295,7 +300,6 @@ void open_and_read_all(struct uring_reader* r) {
         r->sring_array[i] = i;
         tail++;
     }
-    tail++;
     /* Update the tail */
     io_uring_smp_store_release(r->sring_tail, tail);
 
@@ -319,9 +323,18 @@ void open_and_read_all(struct uring_reader* r) {
         struct io_uring_sqe *sqe = &r->sqes[cqe->user_data];
         checkerr_sys(
                 cqe->res,
-                "read up to %d bytes from file %d through uring", r->per_file_buffer_sz, (int)cqe->user_data
+                "read up to %d bytes from %s through uring",
+                r->per_file_buffer_sz,
+                r->filenames[cqe->user_data]
         );
-        printf("%d bytes read from file %d\n", cqe->res, sqe->fd);
+        char* buffer = &r->registered_buffer[sqe->user_data * r->per_file_buffer_sz];
+        char* newline_at = memchr(buffer, '\n', r->per_file_buffer_sz);
+        if (newline_at == NULL) {
+            memcpy(&buffer[16], " ...\0", 5);
+        } else {
+            *newline_at = '\0';
+        }
+        printf("%d bytes read from %s; first line: %s\n", cqe->res, r->filenames[cqe->user_data], buffer);
         head++;
     }
     /* Write barrier so that update to the head are made visible */
@@ -335,9 +348,7 @@ int main(int argc, const char* const* argv) {
     }
 
     struct uring_reader r = setup_ring(argc-1, 16*1024);
-    for (int i=1; i<argc; i++) {
-        add_file_to_open(&r, argv[i]);
-    }
+    add_files_to_open(&r, &argv[1]);
     open_and_read_all(&r);
 
     close(r.ring_fd);
