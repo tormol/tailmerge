@@ -114,7 +114,12 @@ struct uring_reader {
 void create_ring(struct uring_reader* r) {
     // create inactive ring
     struct io_uring_params setup_params = {0};
-    setup_params.sq_entries = setup_params.cq_entries = r->files;
+    int capacity = r->files;
+    // need one extra to fit 2*the bigger half when odd
+    if (capacity & 1 != 0) {
+        capacity++;
+    }
+    setup_params.sq_entries = setup_params.cq_entries = capacity;
     //setup_params.flags |= IORING_SETUP_IOPOLL; // busy-wait, requires O_DIRECT
     setup_params.flags |= IORING_SETUP_CQSIZE; // use .cq_entries instead of the separate argument
     setup_params.flags |= IORING_SETUP_R_DISABLED; // I want to limit to open, read and write
@@ -124,10 +129,10 @@ void create_ring(struct uring_reader* r) {
     #ifdef IORING_SETUP_COOP_TASKRUN // I don't have 5.19 yet, and not required
         setup_params.flags |= IORING_SETUP_COOP_TASKRUN; // don't signal on completion
     #endif
-    int ring_fd = checkerr(io_uring_setup(r->files, &setup_params), "create ring");
+    int ring_fd = checkerr(io_uring_setup(capacity, &setup_params), "create ring");
     printf(
             "Got uring with %d sqes and %d cqes (wanted %d).\n",
-            setup_params.sq_entries, setup_params.cq_entries, r->files
+            setup_params.sq_entries, setup_params.cq_entries, capacity
     );
 
     // create rings (copied from example in man io_uring)
@@ -291,12 +296,14 @@ void uring_open_files
     register_to_ring(r);
     r->filenames = filenames;
 
+    printf("initial stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     unsigned int tail = *r->sring_tail;
     for (int i = 0; i < r->files/2; i++) {
         open_and_read(r, i, &tail);
     }
     /* Update the tail */
     io_uring_smp_store_release(r->sring_tail, tail);
+    printf("before half submit stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     int to_consume = (r->files/2)*2;
     do
     {
@@ -307,6 +314,7 @@ void uring_open_files
         printf("io_uring_enter() consumed %d of %d OPENAT+READ_FIXED sqes\n", consumed_now, to_consume);
         to_consume -= consumed_now;
     } while (to_consume > 0);
+    printf("after half submit stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
 
     /* Add our submission queue entry to the tail of the SQE ring buffer */
     tail = *r->sring_tail;
@@ -325,12 +333,14 @@ void uring_read(struct uring_reader* r) {
     * causes the io_uring_enter() call to wait until min_complete
     * (the 3rd param) events complete.
     * */
+    printf("before GETEVNTS stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     int consumed_now = checkerr(
             io_uring_enter(r->ring_fd, r->to_submit, 1, IORING_ENTER_GETEVENTS),
             "io_uring_enter()"
     );
     printf("io_uring_enter() consumed %d of %d sqes\n", consumed_now, r->to_submit);
     r->to_submit -= consumed_now;
+    printf("after GETEVENTS stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
 
     /* Read barrier */
     unsigned int chead = io_uring_smp_load_acquire(r->cring_head);
