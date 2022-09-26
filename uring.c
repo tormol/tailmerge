@@ -22,7 +22,6 @@
 #include <stdio.h> // fprintf() and stderr
 #include <stdlib.h> // exit()
 #include <stdarg.h> // used by checkerr()
-//#include <stdbool.h>
 #include <unistd.h> // syscall()
 #include <sys/syscall.h> // syscall numbers
 #include <sys/uio.h> // struct iovec
@@ -33,6 +32,7 @@
 #include <fcntl.h> // open()
 #include <stdatomic.h>
 #include <assert.h>
+#include <stdbool.h>
 
 /* helper functions */
 
@@ -109,7 +109,13 @@ struct uring_reader {
     char* registered_buffer;
     off_t* bytes_read;
     int* lines_read;
+    int* incomplete_line_length;
     int open_files; // added files - completely read files
+    /// since there is only one buffer per file, and our api is pull-based,
+    /// we need to copy unfinished line to start of buffer when the function is called the next time
+    /// -1 or file index for which buffer[copy_from..copy_from+line_length] should be copied to 0...
+    int needs_copy;
+    int copy_from;
 };
 
 void create_ring(struct uring_reader* r) {
@@ -277,29 +283,32 @@ void uring_open_files
     // allocate the buffers for all files at once
     unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
     // also allocate the list of bytes read and line numbers at the end of it
-    unsigned int alloc_sz = buffers_sz + r->files * (sizeof(off_t)+sizeof(int));
-    char* buffers = mmap(
+    unsigned int alloc_sz = buffers_sz + r->files * (sizeof(off_t) + 2*sizeof(int));
+    char* alloc = mmap(
             (void*)0, alloc_sz,
             PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
             -1/*fd*/, 0/*offset in file*/
     );
-    if (buffers == MAP_FAILED)
+    if (alloc == MAP_FAILED)
     {
         checkerr(-1, "mmap()ing %dKiB of buffers", alloc_sz/1024);
     }
-    r->registered_buffer = buffers;
-    r->bytes_read = (off_t*)&buffers[buffers_sz];
-    r->lines_read = (int*)&buffers[buffers_sz + r->files*sizeof(off_t)];
+    r->registered_buffer = alloc;
+    alloc += buffers_sz;
+    r->bytes_read = (off_t*)alloc;
+    alloc += r->files * sizeof(off_t);
+    r->lines_read = (int*)alloc;
+    alloc += r->files * sizeof(int);
+    r->incomplete_line_length = (int*)alloc;
     // line numbers start at 1
     for (int i = 0; i < r->files; i++) {
         r->lines_read[i] = 1;
     }
+    r->needs_copy = -1;
 
     create_ring(r);
     register_to_ring(r);
-    r->filenames = filenames;
 
-    printf("initial stail %d chead %d ctail %d\n", *r->sring_tail, *r->cring_head, *r->cring_tail);;
     unsigned int tail = *r->sring_tail;
     for (int i = 0; i < r->files/2; i++) {
         open_and_read(r, i, &tail);
@@ -309,8 +318,7 @@ void uring_open_files
     int to_consume = (r->files/2)*2;
     do
     {
-        int consumed_now = checkerr(
-                io_uring_enter(r->ring_fd, to_consume, 1, 0),
+        int consumed_now = checkerr(io_uring_enter(r->ring_fd, to_consume, 0, 0),
                 "io_uring_enter()"
         );
         to_consume -= consumed_now;
@@ -326,93 +334,146 @@ void uring_open_files
     r->to_submit = (r->files - r->files/2)*2;
 }
 
-void handle_read(struct uring_reader* r, int file, int bytes) {
-    char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
+/// returns number of newlines found
+int find_lines(char* buffer, int bytes, int *first_line_length, int *last_line_starts) {
     char* newline_at = memchr(buffer, '\n', bytes);
     if (newline_at == NULL) {
-        memcpy(&buffer[16], " ...\0", 5);
-    } else {
-        *newline_at = '\0';
+        *first_line_length = bytes;
+        *last_line_starts = bytes;
+        return 0;
     }
-    printf(
-            "%d bytes read from %s: (rest of) line %d: %s\n",
-            bytes, r->filenames[file], r->lines_read[file], buffer
-    );
-    while (newline_at != NULL) {
-        r->lines_read[file]++;
-        bytes -= (int)(newline_at+1-buffer);
-        buffer = newline_at + 1;
-        newline_at = memchr(buffer, '\n', bytes);
-    }
+
+    *first_line_length = (int)(newline_at + 1 - buffer);
+    int lines = 0;
+    char* start_of_line = buffer;
+    do {
+        lines++;
+        int line_length = (int)(newline_at - start_of_line);
+        // start_of_line[line_length] = '\0';
+        // printf("%3d: %s\n", lines, start_of_line);
+        // start_of_line[line_length] = '\n';
+        bytes -= line_length;
+        start_of_line = newline_at + 1;
+        bytes--;
+        newline_at = memchr(start_of_line, '\n', bytes);
+    } while (newline_at != NULL);
+    *last_line_starts = (int)(start_of_line - buffer);
+    return lines;
 }
 
-void uring_read(struct uring_reader* r) {
-    /*
-    * Tell the kernel we have submitted events with the io_uring_enter()
-    * system call. We also pass in the IOURING_ENTER_GETEVENTS flag which
-    * causes the io_uring_enter() call to wait until min_complete
-    * (the 3rd param) events complete.
-    * */
-    int consumed_now = checkerr(
-            io_uring_enter(r->ring_fd, r->to_submit, 1, IORING_ENTER_GETEVENTS),
-            "io_uring_enter()"
-    );
-    r->to_submit -= consumed_now;
+struct line {
+    const char* filename;
+    int line_number;
+    int line_length;
+    char *line;
+    off_t byte_offset;
+};
+
+struct line uring_get_first_line_in_read(struct uring_reader* r) {
+    struct line ret;
+    if (r->needs_copy >= 0) {
+        int file = r->needs_copy;
+        char* buffer = &r->registered_buffer[r->per_file_buffer_sz * file];
+        memcpy(buffer, &buffer[r->copy_from], r->incomplete_line_length[file]);
+        r->needs_copy = -1;
+    }
+    if (r->open_files == 0) {
+        ret.filename = NULL;
+        return ret;
+    }
 
     /* Read barrier */
-    unsigned int chead = io_uring_smp_load_acquire(r->cring_head);
-    unsigned int stail = *r->sring_tail;
+    unsigned int chead;
+start:
+    chead = io_uring_smp_load_acquire(r->cring_head);
     /* Remember, this is a ring buffer. If head == tail, it means that the  buffer is empty. */
-    while (chead != *r->cring_tail) {
-        /* Get the entry */
-        struct io_uring_cqe *cqe = &r->cqes[chead & (*r->cring_mask)];
-        chead++;
-
-        if ((int)cqe->user_data >= r->files) {
-            int file = cqe->user_data - r->files;
-            checkerr_sys(cqe->res, "open %s through uring", r->filenames[file]);
-            continue; // in case link gets broken or something
-        } else {
-            checkerr_sys(
-                    cqe->res,
-                    "read up to %d bytes from %s through uring",
-                    r->per_file_buffer_sz,
-                    r->filenames[cqe->user_data]
-            );
-        }
-
-        // we only get successful completion events from reads
-        int file = cqe->user_data;
-        int bytes_read = cqe->res;
-        const char* filename = r->filenames[file];
-        if (bytes_read == 0) {
-            printf("%s finished\n", filename);
-            r->open_files--;
-            continue;
-        }
-        r->bytes_read[file] += bytes_read;
-
-        handle_read(r, file, bytes_read);
-
-        // and read more
-        unsigned int index = stail & *r->sring_mask;
-        struct io_uring_sqe *sqe = &r->sqes[index];
-        sqe->opcode = IORING_OP_READ_FIXED;
-        sqe->fd = file;
-        sqe->flags = IOSQE_FIXED_FILE;
-        sqe->addr = (size_t)&r->registered_buffer[file*r->per_file_buffer_sz];
-        sqe->len = r->per_file_buffer_sz;
-        sqe->off = r->bytes_read[file];
-        sqe->buf_index = 0;
-        sqe->user_data = file;
-        r->sring_array[index] = index;
-        r->to_submit++;
-        stail++;
+    if (chead == *r->cring_tail || r->to_submit == r->files) {
+        /*
+         * Tell the kernel we have submitted events with the io_uring_enter()
+         * system call. We also pass in the IOURING_ENTER_GETEVENTS flag which
+         * causes the io_uring_enter() call to wait until min_complete
+         * (the 3rd param) events complete.
+         */
+        int consumed_now = checkerr(
+                io_uring_enter(r->ring_fd, r->to_submit, 1, IORING_ENTER_GETEVENTS),
+                "io_uring_enter()"
+        );
+        r->to_submit -= consumed_now;
     }
+
+    /* Get the entry */
+    struct io_uring_cqe *cqe = &r->cqes[chead & (*r->cring_mask)];
+    int file = cqe->user_data;
+    int bytes_read = cqe->res;
     /* Write barrier so that update to the head are made visible */
-    io_uring_smp_store_release(r->cring_head, chead);
+    io_uring_smp_store_release(r->cring_head, chead+1);
+
+    if (file >= r->files) {
+        // a file open event
+        file -= r->files;
+        checkerr_sys(bytes_read, "open %s through uring", r->filenames[file]);
+        // in case link gets broken, assume CQE_SKIP_SUCCESS was ignored
+        goto start; // alternatively: return uring_get_first_line_in_read(r);
+    } else {
+        checkerr_sys(
+                bytes_read,
+                "read up to %d bytes from %s through uring",
+                r->per_file_buffer_sz,
+                r->filenames[cqe->user_data]
+        );
+    }
+
+    // we only get successful completion events from reads
+    ret.filename = r->filenames[file];
+    ret.line_number = r->lines_read[file];
+    ret.line = &r->registered_buffer[file * r->per_file_buffer_sz];
+    int previous_line_length = r->incomplete_line_length[file];
+    ret.byte_offset = r->bytes_read[file] - previous_line_length;
+    int line_aligned_bytes_read = bytes_read + previous_line_length;
+    if (line_aligned_bytes_read == 0) {
+        ret.line_length = 0;
+        r->open_files--;
+        return ret;
+    }
+    // if bytes_read == 0 but there was an unterminated line, do another read
+
+    r->bytes_read[file] += bytes_read;
+
+    char* buffer = &r->registered_buffer[file * r->per_file_buffer_sz];
+    int last_line_starts;
+    r->lines_read[file] += find_lines(
+        &buffer[previous_line_length], bytes_read,
+        &ret.line_length, &last_line_starts
+    );
+    ret.line_length += previous_line_length;
+    last_line_starts += previous_line_length;
+    int incomplete_line_length = line_aligned_bytes_read - last_line_starts;
+    r->incomplete_line_length[file] = incomplete_line_length;
+    if (incomplete_line_length != 0) {
+        r->needs_copy = file;
+        r->copy_from = last_line_starts;
+        // printf("%s:%d: incomplete read of line: %d bytes.\n",
+        //         ret.filename, r->lines_read[file], incomplete_line_length);
+    }
+
+    // and read more
+    unsigned int stail = *r->sring_tail;
+    unsigned int index = stail & *r->sring_mask;
+    struct io_uring_sqe *sqe = &r->sqes[index];
+    sqe->opcode = IORING_OP_READ_FIXED;
+    sqe->fd = file;
+    sqe->flags = IOSQE_FIXED_FILE;
+    sqe->addr = (size_t)ret.line + incomplete_line_length;
+    sqe->len = r->per_file_buffer_sz - incomplete_line_length;
+    sqe->off = r->bytes_read[file];
+    sqe->buf_index = 0;
+    sqe->user_data = file;
+    r->sring_array[index] = index;
     /* Update the tail */
-    io_uring_smp_store_release(r->sring_tail, stail);
+    io_uring_smp_store_release(r->sring_tail, stail+1);
+    r->to_submit++;
+
+    return ret;
 }
 
 int main(int argc, const char* const* argv) {
@@ -423,8 +484,28 @@ int main(int argc, const char* const* argv) {
 
     struct uring_reader r;
     uring_open_files(&r, argc-1, &argv[1], 16*1024);
-    while (r.open_files > 0) {
-        uring_read(&r);
+    while (true) {
+        struct line line = uring_get_first_line_in_read(&r);
+        if (line.filename == NULL) {
+            break;
+        } else if (line.line_length == 0) {
+            printf("%s finished: %d lines %llu bytes\n",
+                    line.filename, line.line_number,
+                    (unsigned long long int)line.byte_offset
+            );
+        } else {
+            if (line.line_length > 16) {
+                line.line_length = 16;
+            } else {
+                line.line_length--;
+            }
+            line.line[line.line_length] = '\0';
+            printf("%s:%03d (offset %05llu): %s ...\n",
+                    line.filename, line.line_number,
+                    (unsigned long long int)line.byte_offset,
+                    line.line
+            );
+        }
     }
 
     close(r.ring_fd);
