@@ -214,25 +214,11 @@ void register_to_ring(struct uring_reader* r) {
 
     // use one registered buffer for all files
     unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
-    // also allocate the list of bytes read at the end of it
-    unsigned int alloc_sz = buffers_sz + r->files * (sizeof(off_t)+sizeof(int));
-    char* buffers = mmap(
-            (void*)0, alloc_sz,
-            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
-            -1, 0
-    );
-    if (buffers == MAP_FAILED)
-    {
-        checkerr(-1, "mmap()ing %dKiB of buffers", alloc_sz/1024);
-    }
-    struct iovec buffer_vec = {.iov_base = buffers, .iov_len = buffers_sz};
+    struct iovec buffer_vec = {.iov_base = r->registered_buffer, .iov_len = buffers_sz};
     checkerr(
             io_uring_register(r->ring_fd, IORING_REGISTER_BUFFERS, &buffer_vec, 1),
             "registor an already allocated buffer of %dKIB", buffers_sz/1024
     );
-    r->registered_buffer = buffers;
-    r->bytes_read = (off_t*)&buffers[buffers_sz];
-    r->lines_read = (int*)&buffers[buffers_sz+r->files*sizeof(off_t)];
 
     // finally, enable the ring
     checkerr(io_uring_register(r->ring_fd, IORING_REGISTER_ENABLE_RINGS, NULL, 0), "enable the ring");
@@ -287,6 +273,27 @@ void uring_open_files
     r->files = files;
     r->filenames = filenames;
     r->per_file_buffer_sz = per_file_buffer_sz;
+
+    // allocate the buffers for all files at once
+    unsigned int buffers_sz = r->files * r->per_file_buffer_sz;
+    // also allocate the list of bytes read and line numbers at the end of it
+    unsigned int alloc_sz = buffers_sz + r->files * (sizeof(off_t)+sizeof(int));
+    char* buffers = mmap(
+            (void*)0, alloc_sz,
+            PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+            -1/*fd*/, 0/*offset in file*/
+    );
+    if (buffers == MAP_FAILED)
+    {
+        checkerr(-1, "mmap()ing %dKiB of buffers", alloc_sz/1024);
+    }
+    r->registered_buffer = buffers;
+    r->bytes_read = (off_t*)&buffers[buffers_sz];
+    r->lines_read = (int*)&buffers[buffers_sz + r->files*sizeof(off_t)];
+    // line numbers start at 1
+    for (int i = 0; i < r->files; i++) {
+        r->lines_read[i] = 1;
+    }
 
     create_ring(r);
     register_to_ring(r);
