@@ -334,6 +334,15 @@ void uring_open_files
     r->to_submit = (r->files - r->files/2)*2;
 }
 
+#ifdef DEBUG
+void uring_destroy(struct uring_reader *r) {
+    checkerr(close(r->ring_fd), "closing uring");
+    void* alloc_end = &r->incomplete_line_length[r->files];
+    void* alloc_start = r->registered_buffer;
+    checkerr(munmap(alloc_start, alloc_end-alloc_start), "freeing memory");
+}
+#endif
+
 /// returns number of newlines found
 int find_lines(char* buffer, int bytes, int *first_line_length, int *last_line_starts) {
     char* newline_at = memchr(buffer, '\n', bytes);
@@ -507,7 +516,9 @@ int main(int argc, const char* const* argv) {
             );
         }
     }
+#ifdef DEBUG
+    uring_destroy(&r);
+#endif
 
-    close(r.ring_fd);
     return 0;
 }
