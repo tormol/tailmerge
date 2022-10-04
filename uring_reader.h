@@ -1,3 +1,19 @@
+/* This file is part of tailmerge.
+ * Copyright (C) 2022 Torbjørn Birch Moltu
+ *
+ * Licenced under the terms of the GNU Lesser General Public License
+ * as published by the Free Software Foundation,
+ * either version 3 of the License, or (at your option) any later version.
+ *
+ * tailmerge is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+ * See the GNU Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with tailmerge. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 #ifndef _URING_READER_H_
 #define _URING_READER_H_
 
@@ -7,6 +23,7 @@
 #endif
 #include <sys/uio.h> // struct iovec
 #include <sys/types.h> // off_t
+#include <stdbool.h>
 
 /// A struct for reading multiple files at the same time.
 /// Will also support having one writer.
@@ -96,15 +113,15 @@ struct uring_reader {
 /// alloc_extra_other is how many bytes (in addition to extra_buffer_sz) to allocate but not register.
 /// Returns a pointer to the start of the extra buffer. The unregistered memory follows directly after it.
 void* uring_create(struct uring_reader* r,
-        int files, int per_file_buffer_sz,
-        int extra_buffer_sz, int alloc_extra_other
+        unsigned int files, unsigned int per_file_buffer_sz,
+        size_t extra_buffer_sz, size_t alloc_extra_other
 );
 
 /// Close the uring and all opened files, and free memory.
 void uring_destroy(struct uring_reader *r);
 
 /// Complete setup and submit open & initial read for all files.
-void uring_open_files(struct uring_reader* r, const char* const* filenames, int out_fd);
+void uring_open_files(struct uring_reader* r, const char* const* filenames);
 
 /// Get any finished read, submitting queued reads and waiting only if none are ready.
 /// file is set to the file index of the returned read.
