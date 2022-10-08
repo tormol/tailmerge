@@ -40,6 +40,7 @@ $ rm foo.lst bar.lst
 
 ## Limitations
 
+* DOESN"T WORK WITH MORE THAN TWO FILES!
 * Haven't been tested with files that aren't read in one go.
 * Haven't been tested with lines long enough to require growing the buffer.
 * Doesn't do locale-aware sorting.

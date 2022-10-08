@@ -168,6 +168,13 @@ bool sources_less(int left_index, int right_index,
                   int last) {
     struct iovec left_line = source_line(&sources[left_index]);
     struct iovec right_line = source_line(&sources[right_index]);
+#ifdef DEBUG
+    ((char*)left_line.iov_base)[left_line.iov_len-1] = '\0';
+    ((char*)right_line.iov_base)[right_line.iov_len-1] = '\0';
+    fprintf(stderr, "left: %s, right: %s\n", left_line.iov_base, right_line.iov_base);
+    ((char*)left_line.iov_base)[left_line.iov_len-1] = '\n';
+    ((char*)right_line.iov_base)[right_line.iov_len-1] = '\n';
+#endif
     int min_length = left_line.iov_len < right_line.iov_len
                    ? left_line.iov_len
                    : right_line.iov_len;
@@ -182,6 +189,9 @@ bool sources_less(int left_index, int right_index,
     if (right_index == last) {
         return false;
     }
+#ifdef DEBUG
+    fprintf(stderr, "returns number-based: %d < %d\n", left_index, right_index);
+#endif
     return left_index < right_index;
 }
 
@@ -264,12 +274,18 @@ int sorter_pop(struct sorter *sorter,
         int left = (top+1)*2-1;
         int right = (top+1)*2;
         int after = top;
+#ifdef DEBUG
+        fprintf(stderr, "left: %d, right: %d, top: %d\n", left, right, top);
+#endif
         if (left < sorter->heapified  &&
             sources_less(
                 sorter->elements[left],
                 sorter->elements[after],
                 sources, sources_length, last
             )) {
+#ifdef DEBUG
+            fprintf(stderr, "left\n");
+#endif
             after = left;
         }
         if (right < sorter->heapified  &&
@@ -278,6 +294,9 @@ int sorter_pop(struct sorter *sorter,
                 sorter->elements[after],
                 sources, sources_length, last
             )) {
+#ifdef DEBUG
+            fprintf(stderr, "right\n");
+#endif
             after = right;
         }
         if (after == top) {
@@ -338,7 +357,7 @@ void lines_destroy(struct lines *lines) {
 void lines_flush(struct lines *lines) {
     int completely_written = 0;
     while (completely_written < lines->length) {
-        size_t written = writev(
+        ssize_t written = writev(
             0,
             &lines->to_write[completely_written],
             lines->length-completely_written
