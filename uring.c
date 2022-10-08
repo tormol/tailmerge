@@ -51,6 +51,11 @@ static int find_lines(char* buffer, int bytes, int *first_line_length, int *last
     do {
         lines++;
         int line_length = (int)(newline_at - start_of_line);
+#ifdef DEBUG
+        start_of_line[line_length] = '\0';
+        fprintf(stderr, "%3d: %s\n", lines, start_of_line);
+        start_of_line[line_length] = '\n';
+#endif
         bytes -= line_length;
         start_of_line = newline_at + 1;
         bytes--;
@@ -92,6 +97,9 @@ struct line get_first_line_in_read(struct file_line_info *l, struct iovec read) 
             first_line_length = MAX_PRINT_CHARACTERS - l->incomplete_line_length;
         }
         line.line = l->incomplete_line;
+#ifdef DEBUG
+        fprintf(stderr, "copy %d bytes to offset %d\n", first_line_length, l->incomplete_line_length);
+#endif
         memcpy(&l->incomplete_line[l->incomplete_line_length], read.iov_base, first_line_length);
         line.line_length = l->incomplete_line_length + first_line_length;
     }
@@ -100,13 +108,22 @@ struct line get_first_line_in_read(struct file_line_info *l, struct iovec read) 
     // update for next
     l->lines_read += new_lines;
     int next_incomplete_line_length = read.iov_len - last_line_starts;
+#ifdef DEBUG
+    fprintf(stderr, "prev incomplete: %d, new bytes: %d, next incomplete: %d\n", l->incomplete_line_length, (int)read.iov_len, next_incomplete_line_length);
+#endif
     l->line_start_offset += l->incomplete_line_length + read.iov_len - next_incomplete_line_length;
     l->incomplete_line_length = next_incomplete_line_length;
+#ifdef DEBUG
+    fprintf(stderr, "prev offset: %d, next offset: %d\n", (int)line.byte_offset, (int)l->incomplete_line_length);
+#endif
 
     return line;
 }
 
 static void finish_read(struct file_line_info *l, struct iovec read) {
+#ifdef DEBUG
+    fprintf(stderr, "copy %d last bytes of %d bytes.\n", l->incomplete_line_length, (int)read.iov_len);
+#endif
     // copy incomplete line
     char* bytes = (char*)read.iov_base;
     int line_starts_at = read.iov_len - l->incomplete_line_length;

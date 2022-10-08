@@ -77,10 +77,13 @@ static bool create_ring(struct uring_reader* r) {
         return false;
     }
     checkerr(ring_fd, EX_OSERR, "create ring");
+
+#ifdef DEBUG
     fprintf(stderr,
             "Got uring with %d sqes and %d cqes (wanted %d).\n",
             setup_params.sq_entries, setup_params.cq_entries, capacity
     );
+#endif
 
     // create rings (copied from example in man io_uring)
     int sring_sz = setup_params.sq_off.array + setup_params.sq_entries * sizeof(unsigned);
@@ -407,9 +410,17 @@ start:
         sqe->buf_index = 0;
         sqe->user_data = user_data.raw;
         r->sring_array[index] = index;
+#ifdef DEBUG
+        fprintf(stderr, "file %d read submission: addr = %p, len = %u (base = %p)\n", *file, (void*)sqe->addr, sqe->len, r->registered_buffer);
+        fprintf(stderr, "\tfirst = %c, ", other_buffer[0]);
+        fprintf(stderr, "last = %c\n", other_buffer[sqe->len-1]);
+#endif
         /* Update the tail */
         io_uring_smp_store_release(r->sring_tail, stail+1);
         r->to_submit++;
+#ifdef DEBUG
+        fprintf(stderr, "\tstail %d, index %d, to_submit %d, sqe_addr %p\n", stail, index, r->to_submit, (void*)sqe);
+#endif
     }
 
     return read;
