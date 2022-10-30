@@ -6,11 +6,14 @@ tailmerge: tailmerge.c
 	$(CC) -o tailmerge tailmerge.c $(CFLAGS)
 
 test_heap: test_heap.c heap.c
-	$(CC) -o $@ $^ $(CFLAGS)
+	$(CC) -o $@ $^ $(CFLAGS) -Wno-pointer-arith
+
+test: test_heap test.sh
+	./test.sh
 
 all: tailmerge test_heap
 
 clean:
 	rm -f tailmerge test_heap
 
-.PHONY: clean all
+.PHONY: clean all test
