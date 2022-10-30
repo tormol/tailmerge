@@ -1,12 +1,16 @@
 CC?=gcc
 CFLAGS?=-Wall -Wextra -Wpedantic -std=c11 -g
 
+# only build the main program if no target is given
 tailmerge: tailmerge.c
 	$(CC) -o tailmerge tailmerge.c $(CFLAGS)
 
-clean:
-	rm -f tailmerge
+test_heap: test_heap.c heap.c
+	$(CC) -o $@ $^ $(CFLAGS)
 
-all: tailmerge
+all: tailmerge test_heap
+
+clean:
+	rm -f tailmerge test_heap
 
 .PHONY: clean all
