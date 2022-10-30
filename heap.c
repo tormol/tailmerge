@@ -16,6 +16,7 @@
 
 #include "heap.h"
 #include <string.h>
+#include <stdio.h>
 
 struct heap heap_create(enum heap_type type, unsigned int size) {
     struct heap heap = {
@@ -40,6 +41,18 @@ bool heap_is_empty(const struct heap *heap) {
     return heap->length == 0;
 }
 
+static int slice_cmp(const struct heap_entry *a, const struct heap_entry *b) {
+    size_t a_length = a->slice_key.iov_len;
+    size_t b_length = b->slice_key.iov_len;
+    size_t min_length = a_length < b_length ? a_length : b_length;
+
+    int cmp = memcmp(a->slice_key.iov_base, b->slice_key.iov_base, min_length);
+    if (cmp == 0) {
+        cmp = a_length - b_length;
+    }
+    return cmp;
+}
+
 bool heap_push_slice(struct heap *heap, struct iovec key, int value) {
     if (heap->length == heap->capacity) {
         return false;
@@ -57,19 +70,11 @@ bool heap_push_slice(struct heap *heap, struct iovec key, int value) {
         struct heap_entry *inserted_entry = &heap->entries[inserted-1];
         struct heap_entry *half_entry = &heap->entries[half-1];
 
-        size_t inserted_length = inserted_entry->slice_key.iov_len;
-        size_t half_length = half_entry->slice_key.iov_len;
-        size_t min_length = inserted_length < half_length ? inserted_length : half_length;
-
-        int cmp = memcmp(inserted_entry->slice_key.iov_base, half_entry->slice_key.iov_base, min_length);
         // stop if half is less than inserted
-        if (cmp > 0) {
-            break;
-        }
         // if equal up to the shortest, stop if lengths are equal
         // (meaning all bytes were compared and entries are completely equal)
         // or if half is shorter than inserted (get shortest first)
-        if (cmp == 0 && inserted_length >= half_length) {
+        if (slice_cmp(inserted_entry, half_entry) > 0) {
             break;
         }
 
@@ -107,44 +112,43 @@ int heap_pop_slice_value(struct heap *heap, struct iovec *popped_key) {
 
     // and then fix the heap
     unsigned int new_parent = 1; // use one-based indexing when calculating, to simplify the logic
-    do {
-        struct iovec parent_key = heap->entries[new_parent-1].slice_key;
-        size_t parent_length = parent_key.iov_len;
+    while (new_parent*2 <= heap->length) {// has left child
         unsigned int left_child = new_parent*2;
         unsigned int right_child = left_child+1;
-        if (right_child <= heap->length) {
-            // if right child is less than left child and less than parent
-            struct iovec right_child_key = heap->entries[right_child-1].slice_key;
-            size_t right_child_length = right_child_key.iov_len;
-            size_t min_length_right = parent_length < right_child_length ? parent_length : right_child_length;
-            struct iovec left_child_key = heap->entries[left_child-1].slice_key;
-            size_t left_child_length = left_child_key.iov_len;
-            size_t min_length_child = right_child_length < left_child_length ? right_child_length : left_child_length;
-            if (memcmp(right_child_key.iov_base, left_child_key.iov_base, min_length_child) < 0
-                && memcmp(parent_key.iov_base, right_child_key.iov_base, min_length_right) > 0) {
-                // swap right child with parent
-                struct heap_entry tmp = heap->entries[new_parent-1];
-                heap->entries[new_parent-1] = heap->entries[right_child-1];
-                heap->entries[right_child-1] = tmp;
-                new_parent = right_child;
-                continue;
-            }
+
+        struct heap_entry *parent_entry = &heap->entries[new_parent - 1];
+        struct heap_entry *left_child_entry = &heap->entries[left_child - 1];
+        struct heap_entry *right_child_entry = &heap->entries[right_child - 1];
+
+        // if right child is less than left child and less than parent
+        if (right_child <= heap->length
+            && slice_cmp(right_child_entry, left_child_entry) < 0
+            && slice_cmp(right_child_entry, parent_entry) < 0) {
+            // swap right child with parent
+            struct heap_entry tmp = *parent_entry;
+            *parent_entry = *right_child_entry;
+            *right_child_entry = tmp;
+            new_parent = right_child;
         }
-        if (left_child <= heap->length) {
-            // if left child is less than parent
-            struct iovec left_child_key = heap->entries[left_child-1].slice_key;
-            size_t left_child_length = left_child_key.iov_len;
-            size_t min_length_left = parent_length < left_child_length ? parent_length : left_child_length;
-            if (memcmp(parent_key.iov_base, left_child_key.iov_base, min_length_left) > 0) {
-                // swap right child with parent
-                struct heap_entry tmp = heap->entries[new_parent-1];
-                heap->entries[new_parent-1] = heap->entries[left_child-1];
-                heap->entries[left_child-1] = tmp;
-                new_parent = left_child;
-                continue;
-            }
+        // if left child is less than parent
+        else if (slice_cmp(parent_entry, left_child_entry) > 0) {
+            // swap right child with parent
+            struct heap_entry tmp = *parent_entry;
+            *parent_entry = *left_child_entry;
+            *left_child_entry = tmp;
+            new_parent = left_child;
+        } else {
+            break;
         }
-    } while (false);
+    }
 
     return top_value;
+}
+
+void heap_debug_print(const struct heap *heap) {
+    for (unsigned int i=0; i<heap->length; i++) {
+        printf("%u:", heap->entries[i].value);
+        fwrite(heap->entries[i].slice_key.iov_base, heap->entries[i].slice_key.iov_len, 1, stdout);
+        putchar(i+1 == heap->length ? '\n' : ' ');
+    }
 }

@@ -62,6 +62,9 @@ static int perform_sequence(struct heap *heap, const char* input, pop_callback p
 
     // pop all
     while (!heap_is_empty(heap)) {
+#ifdef DEBUG
+        heap_debug_print(heap);
+#endif
         struct iovec string;
         int value = heap_pop_slice_value(heap, &string);
         pop_callback(string, value);
@@ -119,13 +122,17 @@ static void assert_sequence(struct heap *heap, const char* input,
 
     // run test
     int max_value = perform_sequence(heap, input, pop_store);
-    // prepare results
-    if (string_output.iov_len > 0) {
+    // normalize results with expectations
+    if (string_output.iov_len > 0
+        && (expected_output == NULL || *expected_output == '\0'
+            || expected_output[strlen(expected_output)-1] != ',')) {
         string_output.iov_len--;
     }
     char* got_output = (char*)string_output.iov_base;
     got_output[string_output.iov_len] = '\0';
-    if (value_output.iov_len > 0) {
+    if (value_output.iov_len > 0
+        && (expected_values == NULL || *expected_values == '\0'
+            || expected_values[strlen(expected_values)-1] != ',')) {
         value_output.iov_len--;
     }
     char* got_values = (char*)value_output.iov_base;
@@ -192,6 +199,15 @@ int main(int argc, char** argv) {
         usage(argv[0]);
     }
 
+    // normalize input generated from commands such as `seq`
+    for (int i=1; i<argc; i++) {
+        for (char* arg = argv[i]; *arg != '\0'; arg++) {
+            if (*arg == '\n' || *arg == ' ') {
+                *arg = ',';
+            }
+        }
+    }
+
     if (strcmp(argv[1], "assert") == 0) {
         if (argc < 3 || argc > 6) {
             usage(argv[0]);
@@ -201,7 +217,7 @@ int main(int argc, char** argv) {
         const char* expected_values = argc<5 ? NULL : (*argv[4] == '\0' ? NULL : argv[4]);
         int expected_max_value = argc<6 ? -1 : (int)parse_unsigned(argv[5], "max value", ~0>>1);
 
-        int max_size = strlen(argv[2]);
+        int max_size = strlen(input);
         struct heap heap = heap_create(SLICE_MIN, max_size);
         heap_set_memory(&heap, malloc(heap_get_needed_memory(&heap)));
         assert_sequence(&heap, input, expected_output, expected_values, expected_max_value);

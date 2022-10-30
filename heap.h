@@ -59,4 +59,6 @@ struct iovec heap_peek_key_slice(const struct heap *heap);
 
 int heap_pop_slice_value(struct heap *heap, struct iovec *key);
 
+void heap_debug_print(const struct heap *heap);
+
 #endif // !defined(_HEAP_H_)
