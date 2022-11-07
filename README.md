@@ -1,6 +1,9 @@
 # tailmerge
 
 A simple command line utility for merging files the way `tail -f` does.
+
+![License: LGPL 3.0 or later](<https://img.shields.io/badge/license-LGPL 3.0 or later-orange>) ![Language standard: c11](https://img.shields.io/badge/language-c11-blue) [![cirrus-ci build status](https://api.cirrus-ci.com/github/tormol/tailmerge.svg)](https://cirrus-ci.com/github/tormol/tailmerge)
+
 It differs from `sort -m` in that the file name is printed above each block of lines from one file.
 Lines from the same file are guarenteed to be printed in order.
 
