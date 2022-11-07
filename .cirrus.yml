@@ -1,0 +1,16 @@
+task:
+  name: Linux x86
+  container:
+    image: gcc:latest
+    cpu: 1
+    memory: 512MB
+  build_script:
+    - make
+    - test -x tailmerge
+    - test -z "$(find -type f -executable -not -name '*.*' -not -name tailmerge)"
+  test_script:
+    - make all
+    - make test
+  clean_script:
+    - make clean
+    - test -z "$(find -type f -executable -not -name '*.*')"
