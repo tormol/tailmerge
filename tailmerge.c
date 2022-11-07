@@ -1,5 +1,5 @@
 /* tailmerge - A program to sort together files like tail -f
- * Copyright (C) 2021 Torbjørn Birch Moltu
+ * Copyright (C) 2022 Torbjørn Birch Moltu
  *
  * licenced under the terms of the GNU Lesser General Public License
  * as published by the Free Software Foundation,
@@ -13,6 +13,8 @@
  * You should have received a copy of the GNU Lesser General Public License
  * along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
+
+#include "heap.h"
 
 #include <stdio.h> //
 #include <errno.h> // errno
@@ -163,178 +165,6 @@ bool source_read(struct source *source) {
 }
 
 
-bool sources_less(int left_index, int right_index,
-                  const struct source sources[], int sources_length,
-                  int last) {
-    struct iovec left_line = source_line(&sources[left_index]);
-    struct iovec right_line = source_line(&sources[right_index]);
-#ifdef DEBUG
-    ((char*)left_line.iov_base)[left_line.iov_len-1] = '\0';
-    ((char*)right_line.iov_base)[right_line.iov_len-1] = '\0';
-    fprintf(stderr, "left: %s, right: %s\n", left_line.iov_base, right_line.iov_base);
-    ((char*)left_line.iov_base)[left_line.iov_len-1] = '\n';
-    ((char*)right_line.iov_base)[right_line.iov_len-1] = '\n';
-#endif
-    int min_length = left_line.iov_len < right_line.iov_len
-                   ? left_line.iov_len
-                   : right_line.iov_len;
-    int cmp = memcmp(left_line.iov_base, right_line.iov_base, min_length);
-    if (cmp != 0)
-    {
-        return cmp < 0;
-    }
-    if (left_index == last) {
-        return true;
-    }
-    if (right_index == last) {
-        return false;
-    }
-#ifdef DEBUG
-    fprintf(stderr, "returns number-based: %d < %d\n", left_index, right_index);
-#endif
-    return left_index < right_index;
-}
-
-
-struct sorter {
-    int *elements; //< owned allocation of natural numbers
-    int heapified; //< numbor of sorted elements
-    int unordered; //< number of unsorted elements after heapified
-    int capacity; //< capacity of .elements
-};
-
-struct sorter sorter_create(int max_elements) {
-    struct sorter sorter = {
-        .elements = check_malloc(max_elements * sizeof(int)),
-        .heapified = 0,
-        .unordered = 0,
-        .capacity = max_elements
-    };
-    memset(sorter.elements, -1, sorter.capacity * sizeof(int));
-    return sorter;
-}
-
-void sorter_destroy(struct sorter *sorter) {
-    single_free(&sorter->elements);
-}
-
-// returns -1 if empty
-int sorter_pop(struct sorter *sorter,
-               const struct source sources[], int sources_length,
-               int last) {
-    // push unsorted elements properly until we can do push-then-pop
-    while (sorter->unordered > 1) {
-        int index = sorter->heapified;
-        // up-heap
-        while (index > 0) {
-            // zero-based; odd(1) means left child, even(2) means right
-            int parent = ((index+1)/2)-1;
-            if (! sources_less(
-                    sorter->elements[index],
-                    sorter->elements[parent],
-                    sources, sources_length, last
-            )) {
-                break;
-            }
-            int tmp = sorter->elements[index];
-            sorter->elements[index] = sorter->elements[parent];
-            sorter->elements[parent] = tmp;
-        }
-        sorter->heapified++;
-        sorter->unordered--;
-    }
-    // try push-then-pop (the common case)
-    if (sorter->unordered == 1) {
-        if (sorter->heapified == 0  ||
-            sources_less(
-                sorter->elements[sorter->heapified],
-                sorter->elements[0],
-                sources, sources_length, last
-            )) {
-            int next = sorter->elements[sorter->heapified];
-            sorter->elements[sorter->heapified] = -1;
-            sorter->unordered = 0;
-            return next;
-        } else {
-            // fake a proper heap - works because down-heap puts the last in the root
-            sorter->heapified++;
-            sorter->unordered = 0;
-        }
-    } else if (sorter->heapified == 0) {
-        return -1;
-    }
-    // have a proper heap
-    int next = sorter->elements[0];
-    sorter->heapified--;
-    // down-heap
-    sorter->elements[0] = sorter->elements[sorter->heapified];
-    sorter->elements[sorter->heapified] = -1;
-    int top = 0;
-    while (true) {
-        int left = (top+1)*2-1;
-        int right = (top+1)*2;
-        int after = top;
-#ifdef DEBUG
-        fprintf(stderr, "left: %d, right: %d, top: %d\n", left, right, top);
-#endif
-        if (left < sorter->heapified  &&
-            sources_less(
-                sorter->elements[left],
-                sorter->elements[after],
-                sources, sources_length, last
-            )) {
-#ifdef DEBUG
-            fprintf(stderr, "left\n");
-#endif
-            after = left;
-        }
-        if (right < sorter->heapified  &&
-            sources_less(
-                sorter->elements[right],
-                sorter->elements[after],
-                sources, sources_length, last
-            )) {
-#ifdef DEBUG
-            fprintf(stderr, "right\n");
-#endif
-            after = right;
-        }
-        if (after == top) {
-            break;
-        }
-        after = top;
-    }
-    return next;
-}
-
-void sorter_push(struct sorter *sorter, int value) {
-    int index = sorter->heapified + sorter->unordered;
-    if (index >= sorter->capacity) {
-        fprintf(stderr, "Error adding %d to sorter: already at capacity (%d)\n",
-                        value,
-                        sorter->capacity);
-        exit(EX_SOFTWARE);
-    }
-    if (value < 0) {
-        fprintf(stderr, "Error adding %d to sorter: should not be negative.\n", value);
-        exit(EX_SOFTWARE);
-    }
-    if (value >= sorter->capacity) {
-        fprintf(stderr, "Error adding %d to sorter; should be smaller than %d.\n",
-                        value, sorter->capacity);
-        exit(EX_SOFTWARE);
-    }
-    int *slot = &sorter->elements[index];
-    if (*slot != -1) {
-        fprintf(stderr, "Error adding %d to sorter: slot %d already occupied (%d).\n",
-                        value, index, *slot);
-        exit(EX_SOFTWARE);
-    }
-    *slot = value;
-    sorter->unordered++;
-}
-
-
 struct lines {
     struct iovec *to_write; //< owned allocation
     int length; //< number of unwritten slices
@@ -397,19 +227,21 @@ int main(int argc, const char **argv) {
     struct source *sources = check_malloc(sources_length * sizeof(struct source));
 
     int last = -1;
-    struct sorter sorter = sorter_create(sources_length);
+    struct heap sorter = heap_create(SLICE_MIN, sources_length);
+    heap_set_memory(&sorter, check_malloc(heap_get_needed_memory(&sorter)));
     for (int i=0; i<sources_length; i++) {
         sources[i] = source_create(argv[i+1], 0xffff);
         if (source_read(&sources[i])) {
-            sorter_push(&sorter, i);
+            heap_push_slice(&sorter, source_line(&sources[i]), i);
         } else {
             source_destroy(&sources[i]);
         }
     }
 
     struct lines lines = lines_create(1024);
+    struct iovec line;
     int next = -1;
-    while ((next = sorter_pop(&sorter, sources, sources_length, last)) != -1) {
+    while ((next = heap_pop_slice_value(&sorter, &line)) != -1) {
         if (next != last) {
             // add header
             struct iovec separator = { .iov_base = "\n>>> ", .iov_len = 5 };
@@ -420,7 +252,7 @@ int main(int argc, const char **argv) {
             }
             lines_add(&lines, separator);
             struct iovec name = {
-                .iov_base = sources[next].path,
+                .iov_base = (void*)sources[next].path,
                 .iov_len = strlen(sources[next].path)
             };
             lines_add(&lines, name);
@@ -428,11 +260,12 @@ int main(int argc, const char **argv) {
             last = next;
         }
 
-        struct iovec line = source_line(&sources[next]);
         lines_add(&lines, line);
+
         if (source_advance(&sources[next])) {
+            line = source_line(&sources[next]);
             // have more lines in buffer
-            sorter_push(&sorter, next);
+            heap_push_slice(&sorter, line, next);
         } else if (((char*)line.iov_base)[line.iov_len-1] != '\n') {
             // was truncated
             lines_flush(&lines);
@@ -443,7 +276,7 @@ int main(int argc, const char **argv) {
                 is_truncated = ((char*)line.iov_base)[line.iov_len-1] != '\n';
                 if ((! is_truncated) && source_advance(&sources[next])) {
                     // that means there was a newline
-                    sorter_push(&sorter, next);
+                    heap_push_slice(&sorter, line, next);
                     break;
                 } else {
                     lines_flush(&lines);
@@ -456,7 +289,8 @@ int main(int argc, const char **argv) {
             // need to read more
             lines_flush(&lines);
             if (source_read(&sources[next])) {
-                sorter_push(&sorter, next);
+                line = source_line(&sources[next]);
+                heap_push_slice(&sorter, line, next);
             }
         }
     }
@@ -465,7 +299,7 @@ int main(int argc, const char **argv) {
 
     // optional cleanup
     lines_destroy(&lines);
-    sorter_destroy(&sorter);
+    free(heap_get_memory(&sorter));
     for (int i=0; i<sources_length; i++) {
         source_destroy(&sources[i]);
     }
