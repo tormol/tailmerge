@@ -95,7 +95,7 @@ struct source source_create(const char *path, int default_buffer_size) {
 }
 
 void source_destroy(struct source *source) {
-    single_free(&source->buffer);
+    single_free((void**)&source->buffer);
     if (source->fd != -1) {
         if (close(source->fd) != 0) {
             fprintf(stderr, "Error closing %s: %s\n", source->path, strerror(errno));
@@ -181,7 +181,7 @@ struct lines lines_create(int capacity) {
 }
 
 void lines_destroy(struct lines *lines) {
-    single_free(&lines->to_write);
+    single_free((void**)&lines->to_write);
 }
 
 void lines_flush(struct lines *lines) {
@@ -193,12 +193,13 @@ void lines_flush(struct lines *lines) {
             lines->length-completely_written
         );
         checkerr((int)written, EX_IOERR, "writing to stdout");
-        while (written >= lines->to_write[completely_written].iov_len) {
+        while (written >= (ssize_t)lines->to_write[completely_written].iov_len) {
             written -= lines->to_write[completely_written].iov_len;
             completely_written++;
         }
         if (written != 0) {
-            lines->to_write[completely_written].iov_base += written;
+            void *start = lines->to_write[completely_written].iov_base;
+            lines->to_write[completely_written].iov_base = (char*)start + written;
             lines->to_write[completely_written].iov_len -= written;
         }
     }
@@ -247,7 +248,7 @@ int main(int argc, const char **argv) {
             struct iovec separator = { .iov_base = "\n>>> ", .iov_len = 5 };
             if (last == -1) {
                 // first line of output, skip newline
-                separator.iov_base = &separator.iov_base[1];
+                separator.iov_base = (char*)separator.iov_base + 1;
                 separator.iov_len--;
             }
             lines_add(&lines, separator);
