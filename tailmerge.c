@@ -188,7 +188,7 @@ void lines_flush(struct lines *lines) {
     int completely_written = 0;
     while (completely_written < lines->length) {
         ssize_t written = writev(
-            0,
+            STDOUT_FILENO,
             &lines->to_write[completely_written],
             lines->length-completely_written
         );
