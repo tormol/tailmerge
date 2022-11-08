@@ -1,9 +1,11 @@
 task:
-  name: Linux x86
+  name: Linux gcc
   container:
     image: gcc:latest
     cpu: 1
-    memory: 512MB
+    memory: 256MB
+  info_script:
+    - cc --version
   build_script:
     - make
     - test -x tailmerge
@@ -14,3 +16,11 @@ task:
   clean_script:
     - make clean
     - test -z "$(find -type f -executable -not -name '*.*')"
+
+task:
+  name: Linux arm gcc
+  arm_container:
+    image: gcc:latest
+    cpu: 1
+    memory: 256MB
+  test_script: make test
